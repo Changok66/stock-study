@@ -6,9 +6,22 @@ fibo_indicator.py의 골든크로스/데드크로스 로직을 재사용해
 비교 기준인 매수 후 보유(Buy & Hold) 수익률을 함께 계산한다.
 """
 
+import argparse
+
 import pandas as pd
 
 import fibo_indicator as fi
+
+# --- 학습/검증 구간 분리 ---
+# 학습 구간(train)에서만 ADX_THRESHOLD 등 전략 조건을 조정하고,
+# 검증 구간(val)은 조정된 조건을 한 번도 보여주지 않은 채 마지막에 딱 한 번만 시험한다.
+# 지표(EMA/볼린저밴드/ADX)는 항상 전체 데이터로 계산한 뒤, 매매 신호만 구간으로 잘라서 본다 -
+# 그래야 검증 구간 초반(2025년 1월경) 지표도 워밍업 부족 없이 정확하게 계산된다.
+SPLIT_RANGES: dict[str, tuple[pd.Timestamp | None, pd.Timestamp | None]] = {
+    "train": (pd.Timestamp("2021-01-01"), pd.Timestamp("2024-12-31")),
+    "val": (pd.Timestamp("2025-01-01"), pd.Timestamp("2026-12-31")),
+    "all": (None, None),
+}
 
 # --- 수수료 관련 상수 ---
 BUY_FEE_RATE = 0.00015                    # 매수 수수료 0.015%
@@ -96,9 +109,29 @@ def prepare_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     return df, crossovers
 
 
-def run_backtest(df: pd.DataFrame, crossovers: pd.DataFrame) -> tuple[pd.DataFrame, dict | None, int]:
+def filter_by_split(df: pd.DataFrame, crossovers: pd.DataFrame, split: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    매수: 골든크로스가 뜨고 그날 ADX > ADX_THRESHOLD(추세 있음)일 때만, 다음 거래일 시가로 매수
+    지표가 이미 계산된 전체 df/crossovers를, 학습/검증 구간 경계로만 잘라낸다.
+    지표 계산에는 영향을 주지 않고(전체 데이터로 이미 계산됨) 매매 신호 탐색 범위만 좁힌다.
+    """
+    start, end = SPLIT_RANGES[split]
+    if start is not None:
+        df = df[df["Date"] >= start]
+        crossovers = crossovers[crossovers["Date"] >= start]
+    if end is not None:
+        df = df[df["Date"] <= end]
+        crossovers = crossovers[crossovers["Date"] <= end]
+
+    return df.reset_index(drop=True), crossovers.reset_index(drop=True)
+
+
+def run_backtest(
+    df: pd.DataFrame, crossovers: pd.DataFrame, use_adx_filter: bool = True,
+) -> tuple[pd.DataFrame, dict | None, int]:
+    """
+    매수: 골든크로스가 뜨면 다음 거래일 시가로 매수.
+          use_adx_filter=True(기본값)면 그날 ADX > ADX_THRESHOLD(추세 있음)일 때만 매수하고,
+          False면 ADX와 무관하게 골든크로스마다 매수한다(원본 피보/역피보 지표 그대로).
     매도: 데드크로스가 뜨면 다음 거래일 시가로 매도
           (EXIT_ON_ADX_WEAKEN=True이면, 보유 중 ADX가 ADX_THRESHOLD 아래로 떨어져도 다음 거래일 시가로 매도)
 
@@ -128,8 +161,9 @@ def run_backtest(df: pd.DataFrame, crossovers: pd.DataFrame) -> tuple[pd.DataFra
 
         if position is None:
             if date in golden_dates:
-                if pd.notna(adx) and adx > ADX_THRESHOLD:
-                    # 추세 있음 확인 -> 다음 거래일 시가로 매수
+                passes_adx = (not use_adx_filter) or (pd.notna(adx) and adx > ADX_THRESHOLD)
+                if passes_adx:
+                    # (필터 미사용이거나) 추세 있음 확인 -> 다음 거래일 시가로 매수
                     position = {
                         "buy_date": next_day["Date"],
                         "buy_price": next_day["Open"],
@@ -200,15 +234,34 @@ def compute_buy_and_hold_return(df: pd.DataFrame) -> float:
     return (sell_proceeds / buy_cost - 1) * 100
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="골든/데드크로스 + ADX 필터 백테스트")
+    parser.add_argument(
+        "--split", choices=list(SPLIT_RANGES.keys()), default="all",
+        help="train=학습 구간(2021~2024)만, val=검증 구간(2025~2026)만, all=전체 구간(기본값)",
+    )
+    parser.add_argument(
+        "--no-adx-filter", action="store_true",
+        help="ADX 필터를 끄고 골든크로스마다 매수(원본 피보/역피보 지표 그대로). 기본은 ADX 필터 사용",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
     df, crossovers = prepare_data()
-    print(f"[INFO] 데이터 기간: {df['Date'].min().date()} ~ {df['Date'].max().date()}")
+    df, crossovers = filter_by_split(df, crossovers, args.split)
+
+    use_adx_filter = not args.no_adx_filter
+
+    print(f"[INFO] 구간: {args.split} ({df['Date'].min().date()} ~ {df['Date'].max().date()})")
     print(f"[INFO] 감지된 교차 지점: {len(crossovers)}건")
-    print(f"[INFO] 매수 필터: ADX({ADX_PERIOD}) > {ADX_THRESHOLD} / "
+    print(f"[INFO] 매수 필터: {f'ADX({ADX_PERIOD}) > {ADX_THRESHOLD}' if use_adx_filter else '미사용(골든크로스마다 매수)'} / "
           f"ADX 약화 시 청산: {'사용' if EXIT_ON_ADX_WEAKEN else '미사용(데드크로스만)'}")
 
     # 1~2. 백테스트 실행 (골든크로스+ADX 필터 다음날 매수 / 데드크로스(옵션: ADX 약화) 다음날 매도)
-    trades_df, open_position, skipped_weak_adx = run_backtest(df, crossovers)
+    trades_df, open_position, skipped_weak_adx = run_backtest(df, crossovers, use_adx_filter=use_adx_filter)
     print(f"[INFO] ADX 조건 미달로 보류된 골든크로스: {skipped_weak_adx}건")
 
     # 3. 매매 내역 표
@@ -223,9 +276,16 @@ def main():
               f"매수가 {open_position['buy_price']:,.0f}원 (데이터 마지막 날까지 매도 신호 없음)")
 
     # 매매 내역을 CSV로 저장 (완료된 매매가 있을 때만)
+    # split/ADX 필터 여부를 번갈아 실행해도 서로 덮어쓰지 않도록 파일명에 반영한다
+    suffix = ""
+    if args.split != "all":
+        suffix += f"_{args.split}"
+    if not use_adx_filter:
+        suffix += "_noadx"
+    output_path = TRADES_OUTPUT_PATH.replace(".csv", f"{suffix}.csv") if suffix else TRADES_OUTPUT_PATH
     if not trades_df.empty:
-        trades_df.to_csv(TRADES_OUTPUT_PATH, index=False, encoding="utf-8-sig")
-        print(f"\n[INFO] 매매 내역 저장 완료: {TRADES_OUTPUT_PATH}")
+        trades_df.to_csv(output_path, index=False, encoding="utf-8-sig")
+        print(f"\n[INFO] 매매 내역 저장 완료: {output_path}")
 
     # 4. 전체 누적 수익률 (완료된 매매만 복리로 반영)
     cumulative_return = compute_cumulative_return(trades_df)
