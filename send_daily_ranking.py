@@ -26,16 +26,23 @@
 3. get_kiwoom_marketcap_ranking.request_stock_list()로 KOSPI+KOSDAQ 전체
    종목을 모은 뒤, 같은 방식으로 ETF/ETN·우선주를 제외하고 시가총액
    (상장주식수 x 현재가) 기준으로 정렬해 상위 TOP_N개를 추린다.
-4. 세 리스트를 각각 "카테고리 제목 + 순위 / 종목명 / 등락률" 위주의
+4. 실시간종목조회순위/거래대금상위 TOP_N(종목명/종목코드/등락률)을
+   data/daily_ranking_log.csv에 이어서(append) 기록한다. 파일이 없으면 헤더를 포함해
+   새로 만들고, 있으면 헤더 없이 행만 추가한다. 이 기록은 카카오톡 전송 성공 여부와
+   무관하게 조회할 때마다 남긴다.
+5. 세 리스트를 각각 "카테고리 제목 + 조회 시각 + 순위 / 종목명 / 등락률" 위주의
    별도 텍스트로 정리한다.
    (단, 시가총액상위는 ka10099 응답에 등락률 필드가 없어 대신 시가총액(억원)을 보여준다.
     이는 이전 대화에서 확인한 ka10099 API 자체의 한계다.)
-5. send_kakao_message.load_access_token()/build_text_template()/send_memo()를
+6. send_kakao_message.load_access_token()/build_text_template()/send_memo()를
    그대로 호출해 카테고리별 메시지를 전송 전 글자 수를 출력하며 순차적으로
    카카오톡으로 전송한다.
 """
 
+import csv
+import os
 import sys
+from datetime import datetime
 
 # 아래 세 모듈은 오늘 이미 만들어둔 스크립트를 그대로 import해서 재사용한다.
 # (모듈 이름 그대로 쓰면 매번 "get_kiwoom_ranking.xxx"처럼 길어지므로 별칭을 붙인다)
@@ -48,6 +55,10 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 # 각 순위 항목별로 몇 개씩 뽑아 보여줄지
 TOP_N = 20
+
+# 실시간종목조회순위/거래대금상위 TOP_N을 누적 기록하는 CSV 로그 경로
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "daily_ranking_log.csv")
+LOG_HEADER = ["날짜", "시간", "카테고리", "순위", "종목명", "종목코드", "등락률"]
 
 
 def fetch_inquiry_and_value_top5(token: str) -> dict:
@@ -115,11 +126,40 @@ def fetch_marketcap_top5(token: str) -> list:
     return ranked[:TOP_N]
 
 
+def append_ranking_log(category: str, items: list, rate_field: str, date_str: str, time_str: str) -> None:
+    """
+    카테고리 하나의 TOP_N 리스트를 data/daily_ranking_log.csv에 이어서(append) 기록한다.
+
+    파일이 없으면 헤더를 포함해 새로 만들고, 있으면 헤더 없이 데이터 행만 추가한다.
+    실시간종목조회순위(ka00198)는 등락률 필드명이 base_comp_chgr, 거래대금상위(ka10032)는
+    flu_rt로 서로 달라서 어떤 필드를 등락률로 쓸지 rate_field로 지정받는다.
+    """
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    file_exists = os.path.exists(LOG_PATH)
+
+    with open(LOG_PATH, "a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(LOG_HEADER)
+        for i, item in enumerate(items, start=1):
+            writer.writerow([
+                date_str,
+                time_str,
+                category,
+                i,
+                item.get("stk_nm", ""),
+                item.get("stk_cd", ""),
+                item.get(rate_field, ""),
+            ])
+
+    print(f"[INFO] {category} TOP{len(items)}을(를) {LOG_PATH}에 기록했습니다.")
+
+
 # 카카오 "나에게 보내기" 텍스트 메시지의 안전한 길이 기준(글자 수)
 MAX_MESSAGE_LENGTH = 200
 
 
-def build_inquiry_message(inquiry_top: list) -> str:
+def build_inquiry_message(inquiry_top: list, queried_at: str) -> str:
     """
     실시간종목조회순위(ka00198) 리스트를 "[실시간종목조회순위 TOP{TOP_N}]" 제목의
     메시지 본문으로 정리한다.
@@ -127,7 +167,7 @@ def build_inquiry_message(inquiry_top: list) -> str:
     ka00198 응답에는 ka10030/ka10032와 달리 flu_rt(등락률) 필드가 없고, 대신
     base_comp_chgr(기준가 대비 등락율, 부호 포함 %)가 온다.
     """
-    lines = [f"[실시간종목조회순위 TOP{TOP_N}]"]
+    lines = [f"[실시간종목조회순위 TOP{TOP_N}]", queried_at, ""]
     for i, item in enumerate(inquiry_top, start=1):
         lines.append(f"{i}. {item.get('stk_nm', '')} ({item.get('base_comp_chgr', '')}%)")
     return "\n".join(lines)
@@ -152,23 +192,23 @@ def format_rank_change(item: dict) -> str:
     return "-"
 
 
-def build_value_message(value_top: list) -> str:
+def build_value_message(value_top: list, queried_at: str) -> str:
     """거래대금상위(ka10032) 리스트를 "[거래대금상위 TOP{TOP_N}]" 제목의 메시지 본문으로 정리한다."""
-    lines = [f"[거래대금상위 TOP{TOP_N}]"]
+    lines = [f"[거래대금상위 TOP{TOP_N}]", queried_at, ""]
     for i, item in enumerate(value_top, start=1):
         rank_change = format_rank_change(item)
         lines.append(f"{i}. {item.get('stk_nm', '')} ({item.get('flu_rt', '')}%) [{rank_change}]")
     return "\n".join(lines)
 
 
-def build_marketcap_message(marketcap_top: list) -> str:
+def build_marketcap_message(marketcap_top: list, queried_at: str) -> str:
     """
     시가총액상위(ka10099 기반) 리스트를 "[시가총액상위 TOP{TOP_N}]" 제목의 메시지 본문으로 정리한다.
 
     ka10099 응답에는 등락률 필드가 없어서, 대신 계산한 시가총액을 억원 단위로 보여준다
     (name 필드, market_cap은 fetch_marketcap_top5에서 계산해둠).
     """
-    lines = [f"[시가총액상위 TOP{TOP_N}]"]
+    lines = [f"[시가총액상위 TOP{TOP_N}]", queried_at, ""]
     for i, item in enumerate(marketcap_top, start=1):
         cap_eok = item["market_cap"] // 100_000_000
         lines.append(f"{i}. {item.get('name', '')} ({cap_eok:,}억원)")
@@ -211,12 +251,22 @@ def main():
     # 3. 시가총액상위 조회
     mc_top5 = fetch_marketcap_top5(token)
 
-    # 4. 카테고리별로 메시지 본문을 따로 정리한다 (하나로 합치지 않는다)
-    inquiry_message = build_inquiry_message(vv["ka00198"])
-    value_message = build_value_message(vv["ka10032"])
-    marketcap_message = build_marketcap_message(mc_top5)
+    # 4. 실시간종목조회순위/거래대금상위 TOP_N을 CSV 로그에 이어서 기록한다
+    # (카카오톡 전송 성공 여부와 무관하게, 조회할 때마다 남긴다)
+    now = datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H:%M")
+    append_ranking_log("실시간종목조회순위", vv["ka00198"], "base_comp_chgr", date_str, time_str)
+    append_ranking_log("거래대금상위", vv["ka10032"], "flu_rt", date_str, time_str)
 
-    # 5. send_kakao_message.py의 전송 기능을 재사용해 카테고리별로 순차 전송한다
+    # 5. 카테고리별로 메시지 본문을 따로 정리한다 (하나로 합치지 않는다)
+    # 세 카테고리 모두 같은 실행에서 조회한 것이므로 조회 시각도 하나로 통일해서 붙인다
+    queried_at = f"{date_str} {time_str}"
+    inquiry_message = build_inquiry_message(vv["ka00198"], queried_at)
+    value_message = build_value_message(vv["ka10032"], queried_at)
+    marketcap_message = build_marketcap_message(mc_top5, queried_at)
+
+    # 6. send_kakao_message.py의 전송 기능을 재사용해 카테고리별로 순차 전송한다
     kakao_token = kakao.load_access_token()
 
     send_category_message(kakao_token, "실시간종목조회순위", inquiry_message)

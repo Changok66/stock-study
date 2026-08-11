@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 .env
 kakao_token.json
+data/daily_ranking_log.csv
