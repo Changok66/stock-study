@@ -42,9 +42,11 @@
    만들어 OneDrive(C:\\Users\\pc\\OneDrive\\주식_3일비교.xlsx)에 저장한다
    (save_three_day_comparison_excel()). 시트 1행에는 "{카테고리} 3일 비교표" 제목을 큰
    글씨로 넣고, 2행부터 최근 3개 날짜를 열로, 순위 1~20을 행으로 삼아 "종목명(값)" 형식의
-   표를 만든다. 열 너비는 제목 행을 제외한 나머지 셀의 표시 너비(한글 등 동아시아 폭
-   넓은 문자는 2, 그 외는 1로 계산)에 맞춰 자동으로 조정한다(autosize_columns()).
-   같은 날짜에 오전/오후 두 번 기록되는 것을 감안해 날짜별로 가장 나중 기록만 사용하며,
+   표를 만든다. 순위 열(A열)은 "1"~"20" 숫자만 들어가므로 RANK_COLUMN_WIDTH(6) 고정
+   너비를 쓰고, 날짜 열은 제목 행을 제외한 나머지 셀의 표시 너비(한글 등 동아시아 폭
+   넓은 문자는 2, 그 외는 1로 계산)에 최소한의 여유(COLUMN_WIDTH_PADDING=2)만 더해
+   자동으로 조정한다(autosize_columns()). 같은 날짜에 오전/오후 두 번 기록되는 것을
+   감안해 날짜별로 가장 나중 기록만 사용하며,
    기록된 날짜가 3일 미만이면 있는 날짜만큼만 나열한다. 파일이 이미
    있으면 새로 만들지 않고 열어서 3개 시트의 표 영역 "값"만 최신 CSV로 덮어쓰므로, 사람이
    엑셀에서 직접 추가한 다른 시트/메모/서식은 다음 실행에도 사라지지 않는다(단, 표 영역
@@ -326,8 +328,13 @@ def format_comparison_value(category: str, raw_value: str) -> str:
     return f"{raw_value}%"
 
 
-# 열 너비를 셀 내용 표시 너비에 맞출 때 더해줄 여유분 (안 잘리도록 넉넉하게)
-COLUMN_WIDTH_PADDING = 5
+# 날짜 열(종목명+등락률이 들어가는 열) 너비를 셀 내용 표시 너비에 맞출 때 더해줄 여유분.
+# 너무 크면 열이 필요 이상으로 넓어지므로, 안 잘리는 선에서 최소한으로만 둔다.
+COLUMN_WIDTH_PADDING = 2
+
+# 순위 열(A열, "1"~"20" 숫자만 들어감)은 내용 기준 자동계산 없이 고정 너비를 쓴다.
+RANK_COLUMN_INDEX = 1
+RANK_COLUMN_WIDTH = 6
 
 # 제목 행(1행)은 열 너비 계산에서 제외한다 (제목이 훨씬 길어서 넣으면 열이 과도하게 넓어짐)
 TITLE_ROW = 1
@@ -347,15 +354,21 @@ def autosize_columns(ws) -> None:
     """
     openpyxl에는 엑셀의 "열 너비 자동 맞춤" 기능이 없어서, 각 열에서(제목 행 제외) 가장 넓은
     셀 내용의 표시 너비를 직접 재서 그 값 + COLUMN_WIDTH_PADDING을 열 너비로 지정하는
-    방식으로 흉내낸다.
+    방식으로 흉내낸다. 다만 순위 열(A열)은 "1"~"20" 숫자만 들어가므로 내용 계산 없이
+    RANK_COLUMN_WIDTH 고정값을 쓴다.
     """
     for col_cells in ws.columns:
+        col_letter = get_column_letter(col_cells[0].column)
+
+        if col_cells[0].column == RANK_COLUMN_INDEX:
+            ws.column_dimensions[col_letter].width = RANK_COLUMN_WIDTH
+            continue
+
         max_width = max(
             (display_width(str(cell.value)) for cell in col_cells
              if cell.value is not None and cell.row != TITLE_ROW),
             default=0,
         )
-        col_letter = get_column_letter(col_cells[0].column)
         ws.column_dimensions[col_letter].width = max_width + COLUMN_WIDTH_PADDING
 
 
