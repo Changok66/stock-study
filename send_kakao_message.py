@@ -12,6 +12,9 @@
 주의:
 - KAKAO_ACCESS_TOKEN은 발급 후 약 12시간이 지나면 만료된다.
   만료된 경우 get_kakao_token.py를 다시 실행해 토큰을 재발급받아야 한다.
+  (또는 아래 refresh_access_token()으로 KAKAO_REFRESH_TOKEN을 이용해 브라우저 로그인 없이
+  재발급받을 수 있다. send_daily_ranking.py/watch_trades.py는 실행할 때마다 이 함수를
+  호출해 액세스 토큰을 미리 갱신해두므로 만료 걱정 없이 쓸 수 있다)
 - "나에게 보내기" 기능을 사용하려면 카카오 개발자 콘솔에서 해당 앱에
   "카카오톡 메시지 전송" 동의항목(talk_message)이 활성화되어 있어야 한다.
 """
@@ -20,13 +23,16 @@ import json
 import os
 
 import requests
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 
 # .env 파일 경로 (이 스크립트와 같은 폴더에 있다고 가정)
 ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
 # 카카오 "나에게 보내기" 메시지 전송 API 주소
 KAKAO_MEMO_SEND_URL = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
+
+# 카카오 토큰 발급/재발급 API 주소 (get_kakao_token.py의 최초 발급과 동일한 엔드포인트)
+KAKAO_TOKEN_URL = "https://kauth.kakao.com/oauth/token"
 
 # 실제로 전송할 메시지 내용 (요청받은 고정 텍스트)
 MESSAGE_TEXT = "테스트 메시지입니다"
@@ -49,6 +55,58 @@ def load_access_token() -> str:
             ".env 파일에 KAKAO_ACCESS_TOKEN 값이 비어 있습니다. "
             "먼저 get_kakao_token.py를 실행해 액세스 토큰을 발급받아주세요."
         )
+
+    return access_token
+
+
+def refresh_access_token() -> str:
+    """
+    .env의 KAKAO_REFRESH_TOKEN으로 카카오 토큰 재발급 API를 호출해 새 액세스 토큰을 받고,
+    .env의 KAKAO_ACCESS_TOKEN을 그 값으로 갱신한 뒤 새 액세스 토큰 문자열을 반환한다.
+
+    get_kakao_token.py의 최초 발급(브라우저 로그인 필요)과 달리, 리프레시 토큰만 있으면
+    브라우저 상호작용 없이 재발급받을 수 있다. KAKAO_ACCESS_TOKEN은 발급 후 약 12시간이면
+    만료되므로, 호출하는 쪽(send_daily_ranking.py/watch_trades.py)에서 실행할 때마다 이
+    함수를 먼저 호출해 항상 새 액세스 토큰으로 전송하도록 한다.
+
+    카카오는 리프레시 토큰 자체도 유효기간이 있어(발급 후 2개월, 액세스 토큰 유효기간의
+    절반 미만으로 남으면), 응답에 새 refresh_token이 함께 내려올 때가 있다. 그 경우 함께
+    갱신해 두지 않으면 다음 재발급 때 예전 리프레시 토큰을 써서 실패할 수 있으므로, 응답에
+    refresh_token이 포함돼 있으면 KAKAO_REFRESH_TOKEN도 함께 갱신한다.
+    """
+    load_dotenv(dotenv_path=ENV_PATH)
+
+    rest_api_key = os.getenv("KAKAO_REST_API_KEY")
+    client_secret = os.getenv("KAKAO_CLIENT_SECRET")
+    refresh_token = os.getenv("KAKAO_REFRESH_TOKEN")
+
+    if not rest_api_key or not refresh_token:
+        raise ValueError(
+            ".env 파일에 KAKAO_REST_API_KEY/KAKAO_REFRESH_TOKEN 값이 필요합니다. "
+            "먼저 get_kakao_token.py를 실행해 토큰을 발급받아주세요."
+        )
+
+    payload = {
+        "grant_type": "refresh_token",
+        "client_id": rest_api_key,
+        "refresh_token": refresh_token,
+    }
+    if client_secret:
+        payload["client_secret"] = client_secret
+
+    response = requests.post(KAKAO_TOKEN_URL, data=payload)
+    response.raise_for_status()
+    token_data = response.json()
+
+    access_token = token_data.get("access_token")
+    if not access_token:
+        raise ValueError(f"응답에서 access_token을 찾을 수 없습니다: {token_data}")
+
+    set_key(ENV_PATH, "KAKAO_ACCESS_TOKEN", access_token)
+
+    new_refresh_token = token_data.get("refresh_token")
+    if new_refresh_token:
+        set_key(ENV_PATH, "KAKAO_REFRESH_TOKEN", new_refresh_token)
 
     return access_token
 

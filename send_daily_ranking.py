@@ -13,31 +13,38 @@
   import만 해서는 자동으로 실행되지 않고 함수만 가져다 쓸 수 있다.
 
 전체 흐름:
-1. get_kiwoom_ranking.load_app_credentials()/issue_access_token()으로
+1. send_kakao_message.refresh_access_token()으로 KAKAO_REFRESH_TOKEN을 이용해 카카오
+   액세스 토큰을 실행할 때마다 무조건 새로 발급받아 .env에 갱신한다. KAKAO_ACCESS_TOKEN은
+   발급 후 약 12시간이면 만료되는데, 이 스크립트는 작업 스케줄러로 무인 실행되므로 매번
+   갱신해두면 밤새 만료돼 있던 토큰으로 실패하는 일이 없다. 갱신 자체가 실패해도(예:
+   네트워크 문제) 예외를 잡아 .env에 남아있는 기존 토큰으로 대체해 계속 진행한다.
+2. get_kiwoom_ranking.load_app_credentials()/issue_access_token()으로
    키움 접근토큰을 "한 번만" 발급받는다. (조회순위/거래대금/시가총액 조회 3번 모두
    이 토큰 하나를 공용으로 사용 - 매번 새로 발급받을 필요가 없다)
-2. get_kiwoom_ranking.request_ranking()을 두 번 호출해
+3. get_kiwoom_ranking.request_ranking()을 두 번 호출해
    실시간종목조회순위(ka00198), 거래대금상위(ka10032)를 각각 조회하고,
    ETF/ETN·우선주를 제외한 뒤 상위 TOP_N개만 추린다.
    (ka00198은 ka10030/ka10032와 달리 거래량/거래대금이 아니라 "실시간 조회 빈도"
     기준 순위이며, 등락률에 해당하는 필드명도 flu_rt가 아니라 base_comp_chgr다.
     get_kiwoom_ranking.request_ranking()이 TR_ID에 따라 요청 URL/payload를
     알아서 분기하므로 이 스크립트에서는 TR_ID만 바꿔주면 된다.)
-3. get_kiwoom_marketcap_ranking.request_stock_list()로 KOSPI+KOSDAQ 전체
+4. get_kiwoom_marketcap_ranking.request_stock_list()로 KOSPI+KOSDAQ 전체
    종목을 모은 뒤, 같은 방식으로 ETF/ETN·우선주를 제외하고 시가총액
    (상장주식수 x 현재가) 기준으로 정렬해 상위 TOP_N개를 추린다.
-4. 세 카테고리(실시간종목조회순위/거래대금상위/시가총액상위) TOP_N(종목명/종목코드/등락률
+5. 세 카테고리(실시간종목조회순위/거래대금상위/시가총액상위) TOP_N(종목명/종목코드/등락률
    또는 시가총액)을 data/daily_ranking_log.csv에 이어서(append) 기록한다. 파일이 없으면
    헤더를 포함해 새로 만들고, 있으면 헤더 없이 행만 추가한다. 이 기록은 카카오톡 전송
    성공 여부와 무관하게 조회할 때마다 남긴다.
-5. 세 리스트를 각각 "카테고리 제목 + 조회 시각 + 순위 / 종목명 / 등락률" 위주의
+6. 세 리스트를 각각 "카테고리 제목 + 조회 시각 + 순위 / 종목명 / 등락률" 위주의
    별도 텍스트로 정리한다.
    (단, 시가총액상위는 ka10099 응답에 등락률 필드가 없어 대신 시가총액(억원)을 보여준다.
     이는 이전 대화에서 확인한 ka10099 API 자체의 한계다.)
-6. send_kakao_message.load_access_token()/build_text_template()/send_memo()를
-   그대로 호출해 카테고리별 메시지를 전송 전 글자 수를 출력하며 순차적으로
-   카카오톡으로 전송한다.
-7. 위 3개 메시지 전송과는 별개로, data/daily_ranking_log.csv를 다시 읽어들여 카테고리별
+7. send_kakao_message.build_text_template()/send_memo()를 그대로 호출해 카테고리별
+   메시지를 전송 전 글자 수를 출력하며 순차적으로 카카오톡으로 전송한다.
+   send_category_message()가 send_memo()의 예외(토큰 만료로 인한 401 등)를 내부에서
+   잡아 로그만 남기고 넘어가므로, 한 카테고리 전송이 실패해도 나머지 카테고리 메시지와
+   8번 3일비교표 저장까지 계속 진행된다.
+8. 위 3개 메시지 전송과는 별개로, data/daily_ranking_log.csv를 다시 읽어들여 카테고리별
    (실시간종목조회순위/거래대금상위/시가총액상위)로 시트를 나눈 "3일 비교표" 엑셀 파일을
    만들어 OneDrive(C:\\Users\\pc\\OneDrive\\주식_3일비교.xlsx)에 저장한다
    (save_three_day_comparison_excel()). 시트 1행에는 "{카테고리} 3일 비교표" 제목을 큰
@@ -52,7 +59,7 @@
    엑셀에서 직접 추가한 다른 시트/메모/서식은 다음 실행에도 사라지지 않는다(단, 표 영역
    안의 값 자체를 사람이 고쳐도 다음 실행 때 다시 최신 값으로 덮어써진다). 엑셀 파일 저장
    후에는 표 내용을 그대로 옮겨 적지 않고, "3일 비교표가 업데이트됐습니다. OneDrive에서
-   확인하세요"라는 짧은 안내 메시지 1개만 카카오톡으로 보낸다. 이 기능은 4~6번 기존 로직을
+   확인하세요"라는 짧은 안내 메시지 1개만 카카오톡으로 보낸다. 이 기능은 5~7번 기존 로직을
    전혀 수정하지 않고 별도 함수로만 추가되어 있다.
 """
 
@@ -262,6 +269,11 @@ def send_category_message(kakao_token: str, title: str, message_text: str) -> No
 
     카카오 "나에게 보내기" 텍스트 템플릿은 너무 긴 메시지를 보내면 실패할 수 있어서,
     전송 전에 글자 수를 출력해 MAX_MESSAGE_LENGTH(200자) 이내인지 눈으로 확인할 수 있게 한다.
+
+    kakao.send_memo()는 HTTP 에러(예: 토큰 만료로 401)가 나면 예외를 던진다. 이 함수를
+    호출하는 쪽(main())에서 예외를 잡지 않으면 카테고리 하나 전송이 실패했을 때 이후
+    남은 다른 카테고리 메시지/3일비교표 저장까지 전부 중단되므로, 여기서 예외를 잡아
+    로그만 남기고 넘어가게 한다.
     """
     length = len(message_text)
     status = "OK" if length <= MAX_MESSAGE_LENGTH else "WARN: 200자 초과"
@@ -273,7 +285,12 @@ def send_category_message(kakao_token: str, title: str, message_text: str) -> No
 
     template_object = kakao.build_text_template(message_text)
     print(f"[INFO] {title} 메시지를 카카오톡 '나에게 보내기'로 전송하는 중입니다...")
-    result = kakao.send_memo(kakao_token, template_object)
+
+    try:
+        result = kakao.send_memo(kakao_token, template_object)
+    except Exception as e:
+        print(f"[FAIL] {title} 메시지 전송 중 오류가 발생했습니다. 다음 단계는 계속 진행합니다: {e}")
+        return
 
     if result.get("result_code") == 0:
         print(f"[INFO] {title} 메시지 전송에 성공했습니다.")
@@ -476,17 +493,29 @@ def save_three_day_comparison_excel(rows: list, path: str = COMPARISON_EXCEL_PAT
 
 
 def main():
-    # 1. 키움 접근토큰을 한 번만 발급받아 세 번의 조회에 공용으로 사용한다
+    # 1. 카카오 액세스 토큰을 실행할 때마다 무조건 새로 갱신한다 (KAKAO_ACCESS_TOKEN은
+    # 발급 후 약 12시간이면 만료되는데, 이 스크립트는 스케줄러로 무인 실행되므로 매번
+    # KAKAO_REFRESH_TOKEN으로 갱신해두면 만료 걱정 없이 쓸 수 있다). 갱신 자체가 실패해도
+    # (예: 네트워크 문제) 스크립트 전체가 죽지 않도록, 실패 시 .env에 남아있는 기존 값으로
+    # 대체해 계속 진행한다 - 그 값이 만료됐더라도 이후 카카오 전송은 send_category_message가
+    # 예외를 잡아 넘어가므로 CSV 기록/3일비교표 저장 같은 나머지 단계에는 영향이 없다.
+    try:
+        kakao_token = kakao.refresh_access_token()
+    except Exception as e:
+        print(f"[WARN] 카카오 액세스 토큰 갱신 실패, 기존 토큰으로 계속 진행합니다: {e}")
+        kakao_token = kakao.load_access_token()
+
+    # 2. 키움 접근토큰을 한 번만 발급받아 세 번의 조회에 공용으로 사용한다
     app_key, secret_key = ranking.load_app_credentials()
     token = ranking.issue_access_token(app_key, secret_key)
 
-    # 2. 실시간종목조회순위/거래대금상위 조회
+    # 3. 실시간종목조회순위/거래대금상위 조회
     vv = fetch_inquiry_and_value_top5(token)
 
-    # 3. 시가총액상위 조회
+    # 4. 시가총액상위 조회
     mc_top5 = fetch_marketcap_top5(token)
 
-    # 4. 실시간종목조회순위/거래대금상위 TOP_N을 CSV 로그에 이어서 기록한다
+    # 5. 실시간종목조회순위/거래대금상위 TOP_N을 CSV 로그에 이어서 기록한다
     # (카카오톡 전송 성공 여부와 무관하게, 조회할 때마다 남긴다)
     now = datetime.now()
     date_str = now.strftime("%Y-%m-%d")
@@ -498,22 +527,22 @@ def main():
         name_field="name", code_field="code",
     )
 
-    # 5. 카테고리별로 메시지 본문을 따로 정리한다 (하나로 합치지 않는다)
+    # 6. 카테고리별로 메시지 본문을 따로 정리한다 (하나로 합치지 않는다)
     # 세 카테고리 모두 같은 실행에서 조회한 것이므로 조회 시각도 하나로 통일해서 붙인다
     queried_at = f"{date_str} {time_str}"
     inquiry_message = build_inquiry_message(vv["ka00198"], queried_at)
     value_message = build_value_message(vv["ka10032"], queried_at)
     marketcap_message = build_marketcap_message(mc_top5, queried_at)
 
-    # 6. send_kakao_message.py의 전송 기능을 재사용해 카테고리별로 순차 전송한다
-    kakao_token = kakao.load_access_token()
-
+    # 7. send_kakao_message.py의 전송 기능을 재사용해 카테고리별로 순차 전송한다.
+    # send_category_message()가 전송 실패를 내부에서 잡아 로그만 남기므로, 한 카테고리가
+    # 실패해도(토큰 문제/네트워크 오류 등) 나머지 카테고리와 8번 3일비교표 저장은 계속된다.
     send_category_message(kakao_token, "실시간종목조회순위", inquiry_message)
     send_category_message(kakao_token, "거래대금상위", value_message)
     send_category_message(kakao_token, "시가총액상위", marketcap_message)
 
-    # 7. 기존 3개 메시지 전송과는 별도로, 카테고리별 3일 비교표 엑셀 파일을 OneDrive에 저장하고
-    # (data/daily_ranking_log.csv를 다시 읽어들여 만들며, 위 6번까지의 동작에는 영향을 주지 않는다)
+    # 8. 기존 3개 메시지 전송과는 별도로, 카테고리별 3일 비교표 엑셀 파일을 OneDrive에 저장하고
+    # (data/daily_ranking_log.csv를 다시 읽어들여 만들며, 위 7번까지의 동작에는 영향을 주지 않는다)
     # 표 내용을 옮겨 적는 대신 업데이트 사실만 짧게 카카오톡으로 알린다
     comparison_rows = load_ranking_log_rows()
     save_three_day_comparison_excel(comparison_rows)

@@ -7,6 +7,8 @@ import requests
 from datetime import datetime, time as dtime
 from dotenv import load_dotenv, set_key
 
+import send_kakao_message as kakao
+
 load_dotenv()
 ENV_PATH = ".env"
 
@@ -55,19 +57,25 @@ def get_today_executions():
     return []
 
 
-def send_kakao(text):
-    headers = {"Authorization": f"Bearer {KAKAO_ACCESS_TOKEN}"}
-    template = {
-        "object_type": "text",
-        "text": text,
-        "link": {"web_url": "https://www.kiwoom.com", "mobile_web_url": "https://www.kiwoom.com"},
-    }
-    resp = requests.post(KAKAO_MEMO_URL, headers=headers,
-                          data={"template_object": json.dumps(template, ensure_ascii=False)})
-    if resp.status_code != 200:
-        print("[FAIL] 카카오톡 전송 실패:", resp.status_code, resp.text[:300])
-    else:
-        print("[OK] 카카오톡 전송 완료")
+def send_kakao(text, access_token):
+    # access_token은 check_once()가 매번 kakao.refresh_access_token()으로 새로 발급받아
+    # 넘겨준다. 여기서 예외가 나도(네트워크 오류 등) 잡아서 로그만 남기고 넘어가야, 체결
+    # 하나의 전송 실패가 나머지 체결 처리(append_log/save_seen_ids)까지 막지 않는다.
+    try:
+        headers = {"Authorization": f"Bearer {access_token}"}
+        template = {
+            "object_type": "text",
+            "text": text,
+            "link": {"web_url": "https://www.kiwoom.com", "mobile_web_url": "https://www.kiwoom.com"},
+        }
+        resp = requests.post(KAKAO_MEMO_URL, headers=headers,
+                              data={"template_object": json.dumps(template, ensure_ascii=False)})
+        if resp.status_code != 200:
+            print("[FAIL] 카카오톡 전송 실패:", resp.status_code, resp.text[:300])
+        else:
+            print("[OK] 카카오톡 전송 완료")
+    except Exception as e:
+        print(f"[FAIL] 카카오톡 전송 중 오류가 발생했습니다. 다음 체결 처리는 계속 진행합니다: {e}")
 
 
 def load_seen_ids():
@@ -114,6 +122,16 @@ def check_once():
         print("[INFO] 새로운 체결 없음")
         return
 
+    # 보낼 체결이 있을 때만 카카오 액세스 토큰을 새로 갱신한다 (--loop로 몇 시간씩 도는
+    # 경우가 많아, 매 체크마다 무조건 갱신해두면 KAKAO_ACCESS_TOKEN이 밤새/장시간 실행 중
+    # 만료돼 조용히 실패하는 일이 없어진다). 갱신이 실패해도 예외를 잡아 기존 토큰으로
+    # 대체하고, 실제 전송 실패는 send_kakao()가 알아서 로그만 남기고 넘어간다.
+    try:
+        kakao_access_token = kakao.refresh_access_token()
+    except Exception as e:
+        print(f"[WARN] 카카오 액세스 토큰 갱신 실패, 기존 토큰으로 계속 진행합니다: {e}")
+        kakao_access_token = KAKAO_ACCESS_TOKEN
+
     for e in new_ones:
         side = "매수" if str(e.get("sell_tp", "")) in ("2", "매수") else "매도"
         msg = (
@@ -122,7 +140,7 @@ def check_once():
             f"체결가 {e.get('cntr_pric','')}원 x {e.get('cntr_qty','')}주\n"
             f"시각: {e.get('cntr_tm','')}"
         )
-        send_kakao(msg)
+        send_kakao(msg, kakao_access_token)
         seen.add(e["ord_no"])
 
     append_log(new_ones)
