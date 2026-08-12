@@ -26,10 +26,10 @@
 3. get_kiwoom_marketcap_ranking.request_stock_list()로 KOSPI+KOSDAQ 전체
    종목을 모은 뒤, 같은 방식으로 ETF/ETN·우선주를 제외하고 시가총액
    (상장주식수 x 현재가) 기준으로 정렬해 상위 TOP_N개를 추린다.
-4. 실시간종목조회순위/거래대금상위 TOP_N(종목명/종목코드/등락률)을
-   data/daily_ranking_log.csv에 이어서(append) 기록한다. 파일이 없으면 헤더를 포함해
-   새로 만들고, 있으면 헤더 없이 행만 추가한다. 이 기록은 카카오톡 전송 성공 여부와
-   무관하게 조회할 때마다 남긴다.
+4. 세 카테고리(실시간종목조회순위/거래대금상위/시가총액상위) TOP_N(종목명/종목코드/등락률
+   또는 시가총액)을 data/daily_ranking_log.csv에 이어서(append) 기록한다. 파일이 없으면
+   헤더를 포함해 새로 만들고, 있으면 헤더 없이 행만 추가한다. 이 기록은 카카오톡 전송
+   성공 여부와 무관하게 조회할 때마다 남긴다.
 5. 세 리스트를 각각 "카테고리 제목 + 조회 시각 + 순위 / 종목명 / 등락률" 위주의
    별도 텍스트로 정리한다.
    (단, 시가총액상위는 ka10099 응답에 등락률 필드가 없어 대신 시가총액(억원)을 보여준다.
@@ -37,6 +37,12 @@
 6. send_kakao_message.load_access_token()/build_text_template()/send_memo()를
    그대로 호출해 카테고리별 메시지를 전송 전 글자 수를 출력하며 순차적으로
    카카오톡으로 전송한다.
+7. 위 3개 메시지 전송과는 별개로, data/daily_ranking_log.csv를 다시 읽어들여
+   카테고리별 "3일 비교" 메시지 3개를 추가로 만들어 순차 전송한다
+   (send_three_day_comparison_messages(), 총 6개 메시지). 같은 날짜에 오전/오후 두 번
+   기록되는 것을 감안해 날짜별로 가장 나중 기록만 사용하며, 기록된 날짜가 3일 미만이면
+   있는 날짜만큼만 비교한다. 이 기능은 4~6번 기존 로직을 전혀 수정하지 않고 별도
+   함수로만 추가되어 있다.
 """
 
 import csv
@@ -123,16 +129,32 @@ def fetch_marketcap_top5(token: str) -> list:
         item["market_cap"] = int(item["listCount"]) * int(item["lastPrice"])
 
     ranked = sorted(common, key=lambda x: x["market_cap"], reverse=True)
-    return ranked[:TOP_N]
+    top = ranked[:TOP_N]
+
+    # CSV 로그에는 등락률 대신 시가총액(억원)을 기록한다 (ka10099에는 등락률 필드가 없음)
+    for item in top:
+        item["market_cap_eok"] = item["market_cap"] // 100_000_000
+
+    return top
 
 
-def append_ranking_log(category: str, items: list, rate_field: str, date_str: str, time_str: str) -> None:
+def append_ranking_log(
+    category: str,
+    items: list,
+    rate_field: str,
+    date_str: str,
+    time_str: str,
+    name_field: str = "stk_nm",
+    code_field: str = "stk_cd",
+) -> None:
     """
     카테고리 하나의 TOP_N 리스트를 data/daily_ranking_log.csv에 이어서(append) 기록한다.
 
     파일이 없으면 헤더를 포함해 새로 만들고, 있으면 헤더 없이 데이터 행만 추가한다.
     실시간종목조회순위(ka00198)는 등락률 필드명이 base_comp_chgr, 거래대금상위(ka10032)는
     flu_rt로 서로 달라서 어떤 필드를 등락률로 쓸지 rate_field로 지정받는다.
+    종목명/종목코드 필드명도 카테고리마다 달라서(ka00198/ka10032는 stk_nm/stk_cd,
+    ka10099 기반 시가총액상위는 name/code) name_field/code_field로 지정받는다.
     """
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
     file_exists = os.path.exists(LOG_PATH)
@@ -147,8 +169,8 @@ def append_ranking_log(category: str, items: list, rate_field: str, date_str: st
                 time_str,
                 category,
                 i,
-                item.get("stk_nm", ""),
-                item.get("stk_cd", ""),
+                item.get(name_field, ""),
+                item.get(code_field, ""),
                 item.get(rate_field, ""),
             ])
 
@@ -240,6 +262,93 @@ def send_category_message(kakao_token: str, title: str, message_text: str) -> No
         print(f"[WARN] {title} 메시지 전송 중 예상치 못한 응답을 받았습니다: {result}")
 
 
+def load_ranking_log_rows() -> list:
+    """
+    data/daily_ranking_log.csv 전체를 딕셔너리 행 리스트로 읽어 돌려준다.
+    (3일치 비교 메시지 전용 함수. 기존 append_ranking_log()/CSV 포맷은 건드리지 않고 읽기만 한다)
+    """
+    if not os.path.exists(LOG_PATH):
+        return []
+    with open(LOG_PATH, "r", newline="", encoding="utf-8-sig") as f:
+        return list(csv.DictReader(f))
+
+
+def latest_snapshot_per_date(rows: list, category: str) -> dict:
+    """
+    카테고리 하나에 대해 날짜별로 그날 가장 나중 시간에 기록된 스냅샷(그 시각에 기록된
+    전체 행, 순위 오름차순)을 모아 {날짜: [행, ...]} 형태로 돌려준다.
+
+    하루에 오전/오후 두 번 기록되는 것을 감안해, 같은 날짜에 여러 시간이 있으면
+    "HH:MM" 문자열 중 가장 큰(=가장 늦은) 시간의 기록만 사용한다.
+    """
+    by_date_time = {}
+    for row in rows:
+        if row.get("카테고리") != category:
+            continue
+        by_date_time.setdefault(row["날짜"], {}).setdefault(row["시간"], []).append(row)
+
+    snapshots = {}
+    for date, by_time in by_date_time.items():
+        latest_time = max(by_time.keys())
+        snapshots[date] = sorted(by_time[latest_time], key=lambda r: int(r["순위"]))
+    return snapshots
+
+
+def find_rank_in_snapshot(snapshot: list, code: str, name: str) -> str:
+    """스냅샷(한 날짜의 순위 행 리스트)에서 종목코드(우선) 또는 종목명으로 순위를 찾는다."""
+    for row in snapshot:
+        if code and row.get("종목코드") == code:
+            return f"{row['순위']}위"
+    for row in snapshot:
+        if row.get("종목명") == name:
+            return f"{row['순위']}위"
+    return "-"
+
+
+def build_three_day_comparison_message(rows: list, category: str, top_n: int = 10) -> str:
+    """
+    카테고리 하나에 대해, 날짜가 다른 최근 3개 날짜(하루 중 가장 나중 기록 기준)를 찾아
+    오늘 상위 top_n개 종목이 그저께/어제/오늘 각각 몇 위였는지 나란히 보여주는 메시지를 만든다.
+
+    기록된 날짜가 아직 3일 미만이면 있는 날짜만큼만 비교하고 안내 문구를 덧붙인다.
+    """
+    snapshots = latest_snapshot_per_date(rows, category)
+    dates = sorted(snapshots.keys())[-3:]  # 오래된 -> 최신 순으로 최근 3개 날짜
+
+    if not dates:
+        return f"[{category} 3일 비교]\n비교할 기록이 아직 없습니다."
+
+    today = dates[-1]
+    today_top = snapshots[today][:top_n]
+
+    date_labels = [datetime.strptime(d, "%Y-%m-%d").strftime("%m/%d") for d in dates]
+    lines = [f"[{category} 3일 비교] ({' → '.join(date_labels)})", ""]
+
+    for i, item in enumerate(today_top, start=1):
+        code = item.get("종목코드", "")
+        name = item.get("종목명", "")
+        ranks = [find_rank_in_snapshot(snapshots[d], code, name) for d in dates]
+        lines.append(f"{i}. {name}: {' → '.join(ranks)}")
+
+    if len(dates) < 3:
+        lines.append("")
+        lines.append(f"아직 {len(dates)}일치 데이터만 있습니다")
+
+    return "\n".join(lines)
+
+
+def send_three_day_comparison_messages(kakao_token: str) -> None:
+    """
+    기존 3개 카카오톡 메시지(TOP20) 전송과는 별개로, 카테고리별 3일 비교 메시지 3개를
+    추가로 만들어 순차 전송한다. 기존 조회/전송 로직에는 전혀 관여하지 않고 CSV 로그를
+    다시 읽어들이는 것만으로 동작한다.
+    """
+    rows = load_ranking_log_rows()
+    for category in ("실시간종목조회순위", "거래대금상위", "시가총액상위"):
+        message = build_three_day_comparison_message(rows, category)
+        send_category_message(kakao_token, f"{category} 3일 비교", message)
+
+
 def main():
     # 1. 키움 접근토큰을 한 번만 발급받아 세 번의 조회에 공용으로 사용한다
     app_key, secret_key = ranking.load_app_credentials()
@@ -258,6 +367,10 @@ def main():
     time_str = now.strftime("%H:%M")
     append_ranking_log("실시간종목조회순위", vv["ka00198"], "base_comp_chgr", date_str, time_str)
     append_ranking_log("거래대금상위", vv["ka10032"], "flu_rt", date_str, time_str)
+    append_ranking_log(
+        "시가총액상위", mc_top5, "market_cap_eok", date_str, time_str,
+        name_field="name", code_field="code",
+    )
 
     # 5. 카테고리별로 메시지 본문을 따로 정리한다 (하나로 합치지 않는다)
     # 세 카테고리 모두 같은 실행에서 조회한 것이므로 조회 시각도 하나로 통일해서 붙인다
@@ -272,6 +385,10 @@ def main():
     send_category_message(kakao_token, "실시간종목조회순위", inquiry_message)
     send_category_message(kakao_token, "거래대금상위", value_message)
     send_category_message(kakao_token, "시가총액상위", marketcap_message)
+
+    # 7. 기존 3개 메시지 전송과는 별도로, 카테고리별 3일 비교 메시지 3개를 추가로 전송한다
+    # (data/daily_ranking_log.csv를 다시 읽어들여 만들며, 위 6번까지의 동작에는 영향을 주지 않는다)
+    send_three_day_comparison_messages(kakao_token)
 
 
 if __name__ == "__main__":
