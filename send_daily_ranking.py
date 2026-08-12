@@ -41,13 +41,13 @@
    (실시간종목조회순위/거래대금상위/시가총액상위)로 시트를 나눈 "3일 비교표" 엑셀 파일을
    만들어 OneDrive(C:\\Users\\pc\\OneDrive\\주식_3일비교.xlsx)에 저장한다
    (save_three_day_comparison_excel()). 시트 1행에는 "{카테고리} 3일 비교표" 제목을 큰
-   글씨로 넣고, 2행부터 최근 3개 날짜를 열로, 순위 1~20을 행으로 삼아 "종목명(값)" 형식의
-   표를 만든다. 순위 열(A열)은 "1"~"20" 숫자만 들어가므로 RANK_COLUMN_WIDTH(6) 고정
-   너비를 쓰고, 날짜 열은 제목 행을 제외한 나머지 셀의 표시 너비(한글 등 동아시아 폭
-   넓은 문자는 2, 그 외는 1로 계산)에 최소한의 여유(COLUMN_WIDTH_PADDING=2)만 더해
-   자동으로 조정한다(autosize_columns()). 같은 날짜에 오전/오후 두 번 기록되는 것을
-   감안해 날짜별로 가장 나중 기록만 사용하며,
-   기록된 날짜가 3일 미만이면 있는 날짜만큼만 나열한다. 파일이 이미
+   글씨로 넣어 A1부터 표의 마지막 날짜 열까지 병합·가운데 정렬하고(merge_title_row()),
+   2행부터 최근 3개 날짜를 열로, 순위 1~20을 행으로 삼아 "종목명(값)" 형식의 표를 만든다.
+   순위 열(A열)은 "1"~"20" 숫자만 들어가므로 RANK_COLUMN_WIDTH(5) 고정 너비를 쓰고,
+   날짜 열은 제목 행을 제외한 나머지 셀의 표시 너비(한글 등 동아시아 폭 넓은 문자는 2,
+   그 외는 1로 계산)에 최소한의 여유(COLUMN_WIDTH_PADDING=2)만 더해 자동으로 조정한다
+   (autosize_columns()). 같은 날짜에 오전/오후 두 번 기록되는 것을 감안해 날짜별로 가장
+   나중 기록만 사용하며, 기록된 날짜가 3일 미만이면 있는 날짜만큼만 나열한다. 파일이 이미
    있으면 새로 만들지 않고 열어서 3개 시트의 표 영역 "값"만 최신 CSV로 덮어쓰므로, 사람이
    엑셀에서 직접 추가한 다른 시트/메모/서식은 다음 실행에도 사라지지 않는다(단, 표 영역
    안의 값 자체를 사람이 고쳐도 다음 실행 때 다시 최신 값으로 덮어써진다). 엑셀 파일 저장
@@ -63,7 +63,7 @@ import unicodedata
 from datetime import datetime
 
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font
+from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
 # 아래 세 모듈은 오늘 이미 만들어둔 스크립트를 그대로 import해서 재사용한다.
@@ -334,7 +334,7 @@ COLUMN_WIDTH_PADDING = 2
 
 # 순위 열(A열, "1"~"20" 숫자만 들어감)은 내용 기준 자동계산 없이 고정 너비를 쓴다.
 RANK_COLUMN_INDEX = 1
-RANK_COLUMN_WIDTH = 6
+RANK_COLUMN_WIDTH = 5
 
 # 제목 행(1행)은 열 너비 계산에서 제외한다 (제목이 훨씬 길어서 넣으면 열이 과도하게 넓어짐)
 TITLE_ROW = 1
@@ -384,14 +384,34 @@ TABLE_HEADER_ROW = TITLE_ROW + 1
 
 # 시트 제목 글씨 크기/굵기 (탭 이름과 별개로 시트 안에도 큰 글씨로 보이도록)
 TITLE_FONT = Font(size=14, bold=True)
+TITLE_ALIGNMENT = Alignment(horizontal="center", vertical="center")
+
+
+def merge_title_row(ws, last_col: int) -> None:
+    """
+    제목 행(A{TITLE_ROW})을 표의 마지막 열(순위 열 + 날짜 열 전체, last_col)까지 병합하고
+    가운데 정렬한다.
+
+    ws는 기존 파일에서 재사용하는 시트일 수 있어서, 이전 실행에서(날짜 열 개수가 달라져)
+    병합해 둔 범위가 이번과 다를 수 있다. openpyxl은 겹치는 범위를 다시 병합하려 하면
+    오류를 내므로, 제목 행에 걸쳐 있는 기존 병합은 먼저 모두 해제한 뒤 새로 병합한다.
+    """
+    for merged_range in list(ws.merged_cells.ranges):
+        if merged_range.min_row <= TITLE_ROW <= merged_range.max_row:
+            ws.unmerge_cells(str(merged_range))
+
+    if last_col > 1:
+        ws.merge_cells(start_row=TITLE_ROW, start_column=1, end_row=TITLE_ROW, end_column=last_col)
+
+    ws.cell(row=TITLE_ROW, column=1).alignment = TITLE_ALIGNMENT
 
 
 def fill_comparison_sheet(ws, category: str, rows: list) -> None:
     """
-    카테고리 하나에 대해, 1행에는 "{category} 3일 비교표" 제목을 큰 글씨로 넣고, 그 아래
-    (2행부터)에 최근 3개 날짜(하루 중 가장 나중 기록 기준)를 열로, 순위 1~TOP_N을 행으로
-    하는 표를 시트에 채운다. 각 셀은 "종목명(값)" 형식으로 채운다(값의 단위는
-    format_comparison_value가 카테고리에 맞게 결정한다).
+    카테고리 하나에 대해, 1행에는 "{category} 3일 비교표" 제목을 큰 글씨로 넣고 표의 마지막
+    열까지 병합·가운데 정렬하며, 그 아래(2행부터)에 최근 3개 날짜(하루 중 가장 나중 기록
+    기준)를 열로, 순위 1~TOP_N을 행으로 하는 표를 시트에 채운다. 각 셀은 "종목명(값)"
+    형식으로 채운다(값의 단위는 format_comparison_value가 카테고리에 맞게 결정한다).
 
     ws는 매번 새로 만드는 게 아니라 기존 파일에서 재사용하는 시트일 수 있어서, 표 영역 밖의
     다른 셀(사람이 추가한 메모 등)이나 셀 서식은 건드리지 않고, 제목/표 영역의 "값"만 최신
@@ -419,6 +439,7 @@ def fill_comparison_sheet(ws, category: str, rows: list) -> None:
             value = format_comparison_value(category, item.get("등락률", ""))
             ws.cell(row=data_row, column=col, value=f"{name}({value})")
 
+    merge_title_row(ws, last_col=1 + len(dates))
     autosize_columns(ws)
 
 
