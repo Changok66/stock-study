@@ -386,6 +386,9 @@ TABLE_HEADER_ROW = TITLE_ROW + 1
 TITLE_FONT = Font(size=14, bold=True)
 TITLE_ALIGNMENT = Alignment(horizontal="center", vertical="center")
 
+# 순위 열(A열)의 1~20 숫자를 가운데 정렬하기 위한 스타일 (날짜 열의 종목명/등락률 값은 그대로 둔다)
+RANK_ALIGNMENT = Alignment(horizontal="center", vertical="center")
+
 
 def merge_title_row(ws, last_col: int) -> None:
     """
@@ -430,7 +433,7 @@ def fill_comparison_sheet(ws, category: str, rows: list) -> None:
 
     for rank in range(1, TOP_N + 1):
         data_row = TABLE_HEADER_ROW + rank
-        ws.cell(row=data_row, column=1, value=rank)
+        ws.cell(row=data_row, column=1, value=rank).alignment = RANK_ALIGNMENT
         for col, d in enumerate(dates, start=2):
             item = next((it for it in snapshots[d] if int(it["순위"]) == rank), None)
             if item is None:
