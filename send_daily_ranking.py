@@ -40,20 +40,29 @@
 7. 위 3개 메시지 전송과는 별개로, data/daily_ranking_log.csv를 다시 읽어들여 카테고리별
    (실시간종목조회순위/거래대금상위/시가총액상위)로 시트를 나눈 "3일 비교표" 엑셀 파일을
    만들어 OneDrive(C:\\Users\\pc\\OneDrive\\주식_3일비교.xlsx)에 저장한다
-   (save_three_day_comparison_excel()). 시트마다 최근 3개 날짜를 열로, 순위 1~20을 행으로
-   삼아 "종목명(값)" 형식의 표를 만든다. 같은 날짜에 오전/오후 두 번 기록되는 것을 감안해
-   날짜별로 가장 나중 기록만 사용하며, 기록된 날짜가 3일 미만이면 있는 날짜만큼만 나열한다.
-   엑셀 파일 저장 후에는 표 내용을 그대로 옮겨 적지 않고, "3일 비교표가 업데이트됐습니다.
-   OneDrive에서 확인하세요"라는 짧은 안내 메시지 1개만 카카오톡으로 보낸다. 이 기능은 4~6번
-   기존 로직을 전혀 수정하지 않고 별도 함수로만 추가되어 있다.
+   (save_three_day_comparison_excel()). 시트 1행에는 "{카테고리} 3일 비교표" 제목을 큰
+   글씨로 넣고, 2행부터 최근 3개 날짜를 열로, 순위 1~20을 행으로 삼아 "종목명(값)" 형식의
+   표를 만든다. 열 너비는 제목 행을 제외한 나머지 셀의 표시 너비(한글 등 동아시아 폭
+   넓은 문자는 2, 그 외는 1로 계산)에 맞춰 자동으로 조정한다(autosize_columns()).
+   같은 날짜에 오전/오후 두 번 기록되는 것을 감안해 날짜별로 가장 나중 기록만 사용하며,
+   기록된 날짜가 3일 미만이면 있는 날짜만큼만 나열한다. 파일이 이미
+   있으면 새로 만들지 않고 열어서 3개 시트의 표 영역 "값"만 최신 CSV로 덮어쓰므로, 사람이
+   엑셀에서 직접 추가한 다른 시트/메모/서식은 다음 실행에도 사라지지 않는다(단, 표 영역
+   안의 값 자체를 사람이 고쳐도 다음 실행 때 다시 최신 값으로 덮어써진다). 엑셀 파일 저장
+   후에는 표 내용을 그대로 옮겨 적지 않고, "3일 비교표가 업데이트됐습니다. OneDrive에서
+   확인하세요"라는 짧은 안내 메시지 1개만 카카오톡으로 보낸다. 이 기능은 4~6번 기존 로직을
+   전혀 수정하지 않고 별도 함수로만 추가되어 있다.
 """
 
 import csv
 import os
 import sys
+import unicodedata
 from datetime import datetime
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
 
 # 아래 세 모듈은 오늘 이미 만들어둔 스크립트를 그대로 import해서 재사용한다.
 # (모듈 이름 그대로 쓰면 매번 "get_kiwoom_ranking.xxx"처럼 길어지므로 별칭을 붙인다)
@@ -317,44 +326,112 @@ def format_comparison_value(category: str, raw_value: str) -> str:
     return f"{raw_value}%"
 
 
-def build_comparison_sheet(workbook: "Workbook", category: str, rows: list) -> None:
+# 열 너비를 셀 내용 표시 너비에 맞출 때 더해줄 여유분 (안 잘리도록 넉넉하게)
+COLUMN_WIDTH_PADDING = 5
+
+# 제목 행(1행)은 열 너비 계산에서 제외한다 (제목이 훨씬 길어서 넣으면 열이 과도하게 넓어짐)
+TITLE_ROW = 1
+
+
+def display_width(text: str) -> int:
     """
-    카테고리 하나에 대해, 최근 3개 날짜(하루 중 가장 나중 기록 기준)를 열로, 순위 1~TOP_N을
-    행으로 하는 시트를 workbook에 추가한다. 각 셀은 "종목명(값)" 형식으로 채운다
-    (값의 단위는 format_comparison_value가 카테고리에 맞게 결정한다).
+    문자열의 "표시 너비"를 센다. 한글/한자 등 동아시아 폭이 넓은(Wide/Fullwidth) 문자는
+    영문 폰트 기준 글자 2개 폭을 차지하므로 2로, 나머지(영문/숫자/기호 등)는 1로 센다.
+    len()만으로 글자 수를 세면 한글이 많이 섞인 셀(예: "삼성전자(+4.56%)")의 실제 표시
+    너비를 과소평가해서 열 너비가 부족해지고 값이 잘려 보이는 문제가 있었다.
     """
-    ws = workbook.create_sheet(title=category)
-    ws.cell(row=1, column=1, value="순위")
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+
+
+def autosize_columns(ws) -> None:
+    """
+    openpyxl에는 엑셀의 "열 너비 자동 맞춤" 기능이 없어서, 각 열에서(제목 행 제외) 가장 넓은
+    셀 내용의 표시 너비를 직접 재서 그 값 + COLUMN_WIDTH_PADDING을 열 너비로 지정하는
+    방식으로 흉내낸다.
+    """
+    for col_cells in ws.columns:
+        max_width = max(
+            (display_width(str(cell.value)) for cell in col_cells
+             if cell.value is not None and cell.row != TITLE_ROW),
+            default=0,
+        )
+        col_letter = get_column_letter(col_cells[0].column)
+        ws.column_dimensions[col_letter].width = max_width + COLUMN_WIDTH_PADDING
+
+
+def get_or_create_sheet(workbook: "Workbook", title: str):
+    """workbook에 title 이름의 시트가 이미 있으면 그걸 재사용하고, 없으면 새로 만든다."""
+    if title in workbook.sheetnames:
+        return workbook[title]
+    return workbook.create_sheet(title=title)
+
+
+# 제목 아래로 표를 몇 행 밀어서 시작할지 (1행: 제목, 2행: 표 헤더, 3행부터: 데이터)
+TABLE_HEADER_ROW = TITLE_ROW + 1
+
+# 시트 제목 글씨 크기/굵기 (탭 이름과 별개로 시트 안에도 큰 글씨로 보이도록)
+TITLE_FONT = Font(size=14, bold=True)
+
+
+def fill_comparison_sheet(ws, category: str, rows: list) -> None:
+    """
+    카테고리 하나에 대해, 1행에는 "{category} 3일 비교표" 제목을 큰 글씨로 넣고, 그 아래
+    (2행부터)에 최근 3개 날짜(하루 중 가장 나중 기록 기준)를 열로, 순위 1~TOP_N을 행으로
+    하는 표를 시트에 채운다. 각 셀은 "종목명(값)" 형식으로 채운다(값의 단위는
+    format_comparison_value가 카테고리에 맞게 결정한다).
+
+    ws는 매번 새로 만드는 게 아니라 기존 파일에서 재사용하는 시트일 수 있어서, 표 영역 밖의
+    다른 셀(사람이 추가한 메모 등)이나 셀 서식은 건드리지 않고, 제목/표 영역의 "값"만 최신
+    CSV 기준으로 덮어쓴다.
+    """
+    ws.cell(row=TITLE_ROW, column=1, value=f"{category} 3일 비교표").font = TITLE_FONT
+
+    ws.cell(row=TABLE_HEADER_ROW, column=1, value="순위")
 
     snapshots = latest_snapshot_per_date(rows, category)
     dates = sorted(snapshots.keys())[-3:]  # 오래된 -> 최신 순으로 최근 3개 날짜
 
     for col, d in enumerate(dates, start=2):
         date_label = datetime.strptime(d, "%Y-%m-%d").strftime("%m/%d")
-        ws.cell(row=1, column=col, value=date_label)
+        ws.cell(row=TABLE_HEADER_ROW, column=col, value=date_label)
 
     for rank in range(1, TOP_N + 1):
-        ws.cell(row=rank + 1, column=1, value=rank)
+        data_row = TABLE_HEADER_ROW + rank
+        ws.cell(row=data_row, column=1, value=rank)
         for col, d in enumerate(dates, start=2):
             item = next((it for it in snapshots[d] if int(it["순위"]) == rank), None)
             if item is None:
                 continue
             name = item.get("종목명", "")
             value = format_comparison_value(category, item.get("등락률", ""))
-            ws.cell(row=rank + 1, column=col, value=f"{name}({value})")
+            ws.cell(row=data_row, column=col, value=f"{name}({value})")
+
+    autosize_columns(ws)
 
 
 def save_three_day_comparison_excel(rows: list, path: str = COMPARISON_EXCEL_PATH) -> None:
     """
-    기존 3개 카카오톡 메시지(TOP20) 전송과는 별개로, 카테고리별로 시트를 나눈 3일 비교표
-    엑셀 파일을 만들어 OneDrive에 저장한다. 기존 조회/전송 로직에는 전혀 관여하지 않고
+    기존 3개 카카오톡 메시지(TOP20) 전송과는 별개로, 카테고리별로 시트를 나눈 3일 비교표를
+    엑셀 파일로 만들어 OneDrive에 저장한다. 기존 조회/전송 로직에는 전혀 관여하지 않고
     CSV 로그를 다시 읽어들이는 것만으로 동작한다.
+
+    파일이 이미 있으면 매번 새로 만들지 않고 load_workbook()으로 열어서 재사용한다.
+    사람이 엑셀 파일에서 직접 서식을 바꾸거나 메모를 남기거나 시트를 추가해 두었어도,
+    이 함수는 카테고리 3개(실시간종목조회순위/거래대금상위/시가총액상위) 시트의 표 영역
+    "값"만 최신 CSV 기준으로 덮어쓸 뿐 그 밖의 시트나 서식은 건드리지 않으므로 사람이 손댄
+    내용이 다음 실행 때 사라지지 않는다. 다만 표 영역 안의 셀 값(종목명/등락률 등)은
+    CSV의 최신 조회 결과를 그대로 반영해야 하므로, 그 부분을 사람이 직접 고쳐도 다음
+    실행 때 다시 최신 값으로 덮어써진다.
     """
-    workbook = Workbook()
-    workbook.remove(workbook.active)  # openpyxl이 기본으로 만드는 빈 시트를 제거
+    if os.path.exists(path):
+        workbook = load_workbook(path)
+    else:
+        workbook = Workbook()
+        workbook.remove(workbook.active)  # openpyxl이 기본으로 만드는 빈 시트를 제거
 
     for category in ("실시간종목조회순위", "거래대금상위", "시가총액상위"):
-        build_comparison_sheet(workbook, category, rows)
+        ws = get_or_create_sheet(workbook, category)
+        fill_comparison_sheet(ws, category, rows)
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     workbook.save(path)
