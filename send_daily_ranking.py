@@ -37,18 +37,23 @@
 6. send_kakao_message.load_access_token()/build_text_template()/send_memo()를
    그대로 호출해 카테고리별 메시지를 전송 전 글자 수를 출력하며 순차적으로
    카카오톡으로 전송한다.
-7. 위 3개 메시지 전송과는 별개로, data/daily_ranking_log.csv를 다시 읽어들여
-   카테고리별 "3일 비교" 메시지 3개를 추가로 만들어 순차 전송한다
-   (send_three_day_comparison_messages(), 총 6개 메시지). 같은 날짜에 오전/오후 두 번
-   기록되는 것을 감안해 날짜별로 가장 나중 기록만 사용하며, 기록된 날짜가 3일 미만이면
-   있는 날짜만큼만 비교한다. 이 기능은 4~6번 기존 로직을 전혀 수정하지 않고 별도
-   함수로만 추가되어 있다.
+7. 위 3개 메시지 전송과는 별개로, data/daily_ranking_log.csv를 다시 읽어들여 카테고리별
+   (실시간종목조회순위/거래대금상위/시가총액상위)로 시트를 나눈 "3일 비교표" 엑셀 파일을
+   만들어 OneDrive(C:\\Users\\pc\\OneDrive\\주식_3일비교.xlsx)에 저장한다
+   (save_three_day_comparison_excel()). 시트마다 최근 3개 날짜를 열로, 순위 1~20을 행으로
+   삼아 "종목명(값)" 형식의 표를 만든다. 같은 날짜에 오전/오후 두 번 기록되는 것을 감안해
+   날짜별로 가장 나중 기록만 사용하며, 기록된 날짜가 3일 미만이면 있는 날짜만큼만 나열한다.
+   엑셀 파일 저장 후에는 표 내용을 그대로 옮겨 적지 않고, "3일 비교표가 업데이트됐습니다.
+   OneDrive에서 확인하세요"라는 짧은 안내 메시지 1개만 카카오톡으로 보낸다. 이 기능은 4~6번
+   기존 로직을 전혀 수정하지 않고 별도 함수로만 추가되어 있다.
 """
 
 import csv
 import os
 import sys
 from datetime import datetime
+
+from openpyxl import Workbook
 
 # 아래 세 모듈은 오늘 이미 만들어둔 스크립트를 그대로 import해서 재사용한다.
 # (모듈 이름 그대로 쓰면 매번 "get_kiwoom_ranking.xxx"처럼 길어지므로 별칭을 붙인다)
@@ -65,6 +70,9 @@ TOP_N = 20
 # 실시간종목조회순위/거래대금상위 TOP_N을 누적 기록하는 CSV 로그 경로
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "daily_ranking_log.csv")
 LOG_HEADER = ["날짜", "시간", "카테고리", "순위", "종목명", "종목코드", "등락률"]
+
+# 카테고리별 3일 비교표를 저장할 엑셀 파일 경로 (OneDrive에 저장해 다른 기기에서도 확인 가능)
+COMPARISON_EXCEL_PATH = r"C:\Users\pc\OneDrive\주식_3일비교.xlsx"
 
 
 def fetch_inquiry_and_value_top5(token: str) -> dict:
@@ -294,59 +302,63 @@ def latest_snapshot_per_date(rows: list, category: str) -> dict:
     return snapshots
 
 
-def find_rank_in_snapshot(snapshot: list, code: str, name: str) -> str:
-    """스냅샷(한 날짜의 순위 행 리스트)에서 종목코드(우선) 또는 종목명으로 순위를 찾는다."""
-    for row in snapshot:
-        if code and row.get("종목코드") == code:
-            return f"{row['순위']}위"
-    for row in snapshot:
-        if row.get("종목명") == name:
-            return f"{row['순위']}위"
-    return "-"
-
-
-def build_three_day_comparison_message(rows: list, category: str, top_n: int = 10) -> str:
+def format_comparison_value(category: str, raw_value: str) -> str:
     """
-    카테고리 하나에 대해, 날짜가 다른 최근 3개 날짜(하루 중 가장 나중 기록 기준)를 찾아
-    오늘 상위 top_n개 종목이 그저께/어제/오늘 각각 몇 위였는지 나란히 보여주는 메시지를 만든다.
+    3일 비교 메시지에서 종목 옆에 괄호로 붙일 값을 카테고리에 맞는 단위로 포맷한다.
 
-    기록된 날짜가 아직 3일 미만이면 있는 날짜만큼만 비교하고 안내 문구를 덧붙인다.
+    실시간종목조회순위/거래대금상위는 CSV "등락률" 칸에 등락률(%) 값이 들어있고,
+    시가총액상위는 같은 칸에 시가총액(억원) 값이 들어있어(append_ranking_log 참고) 단위가 다르다.
     """
+    if category == "시가총액상위":
+        try:
+            return f"{int(raw_value):,}억원"
+        except (TypeError, ValueError):
+            return f"{raw_value}억원"
+    return f"{raw_value}%"
+
+
+def build_comparison_sheet(workbook: "Workbook", category: str, rows: list) -> None:
+    """
+    카테고리 하나에 대해, 최근 3개 날짜(하루 중 가장 나중 기록 기준)를 열로, 순위 1~TOP_N을
+    행으로 하는 시트를 workbook에 추가한다. 각 셀은 "종목명(값)" 형식으로 채운다
+    (값의 단위는 format_comparison_value가 카테고리에 맞게 결정한다).
+    """
+    ws = workbook.create_sheet(title=category)
+    ws.cell(row=1, column=1, value="순위")
+
     snapshots = latest_snapshot_per_date(rows, category)
     dates = sorted(snapshots.keys())[-3:]  # 오래된 -> 최신 순으로 최근 3개 날짜
 
-    if not dates:
-        return f"[{category} 3일 비교]\n비교할 기록이 아직 없습니다."
+    for col, d in enumerate(dates, start=2):
+        date_label = datetime.strptime(d, "%Y-%m-%d").strftime("%m/%d")
+        ws.cell(row=1, column=col, value=date_label)
 
-    today = dates[-1]
-    today_top = snapshots[today][:top_n]
-
-    date_labels = [datetime.strptime(d, "%Y-%m-%d").strftime("%m/%d") for d in dates]
-    lines = [f"[{category} 3일 비교] ({' → '.join(date_labels)})", ""]
-
-    for i, item in enumerate(today_top, start=1):
-        code = item.get("종목코드", "")
-        name = item.get("종목명", "")
-        ranks = [find_rank_in_snapshot(snapshots[d], code, name) for d in dates]
-        lines.append(f"{i}. {name}: {' → '.join(ranks)}")
-
-    if len(dates) < 3:
-        lines.append("")
-        lines.append(f"아직 {len(dates)}일치 데이터만 있습니다")
-
-    return "\n".join(lines)
+    for rank in range(1, TOP_N + 1):
+        ws.cell(row=rank + 1, column=1, value=rank)
+        for col, d in enumerate(dates, start=2):
+            item = next((it for it in snapshots[d] if int(it["순위"]) == rank), None)
+            if item is None:
+                continue
+            name = item.get("종목명", "")
+            value = format_comparison_value(category, item.get("등락률", ""))
+            ws.cell(row=rank + 1, column=col, value=f"{name}({value})")
 
 
-def send_three_day_comparison_messages(kakao_token: str) -> None:
+def save_three_day_comparison_excel(rows: list, path: str = COMPARISON_EXCEL_PATH) -> None:
     """
-    기존 3개 카카오톡 메시지(TOP20) 전송과는 별개로, 카테고리별 3일 비교 메시지 3개를
-    추가로 만들어 순차 전송한다. 기존 조회/전송 로직에는 전혀 관여하지 않고 CSV 로그를
-    다시 읽어들이는 것만으로 동작한다.
+    기존 3개 카카오톡 메시지(TOP20) 전송과는 별개로, 카테고리별로 시트를 나눈 3일 비교표
+    엑셀 파일을 만들어 OneDrive에 저장한다. 기존 조회/전송 로직에는 전혀 관여하지 않고
+    CSV 로그를 다시 읽어들이는 것만으로 동작한다.
     """
-    rows = load_ranking_log_rows()
+    workbook = Workbook()
+    workbook.remove(workbook.active)  # openpyxl이 기본으로 만드는 빈 시트를 제거
+
     for category in ("실시간종목조회순위", "거래대금상위", "시가총액상위"):
-        message = build_three_day_comparison_message(rows, category)
-        send_category_message(kakao_token, f"{category} 3일 비교", message)
+        build_comparison_sheet(workbook, category, rows)
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    workbook.save(path)
+    print(f"[INFO] 3일 비교표를 {path}에 저장했습니다.")
 
 
 def main():
@@ -386,9 +398,15 @@ def main():
     send_category_message(kakao_token, "거래대금상위", value_message)
     send_category_message(kakao_token, "시가총액상위", marketcap_message)
 
-    # 7. 기존 3개 메시지 전송과는 별도로, 카테고리별 3일 비교 메시지 3개를 추가로 전송한다
+    # 7. 기존 3개 메시지 전송과는 별도로, 카테고리별 3일 비교표 엑셀 파일을 OneDrive에 저장하고
     # (data/daily_ranking_log.csv를 다시 읽어들여 만들며, 위 6번까지의 동작에는 영향을 주지 않는다)
-    send_three_day_comparison_messages(kakao_token)
+    # 표 내용을 옮겨 적는 대신 업데이트 사실만 짧게 카카오톡으로 알린다
+    comparison_rows = load_ranking_log_rows()
+    save_three_day_comparison_excel(comparison_rows)
+    send_category_message(
+        kakao_token, "3일비교표 업데이트 알림",
+        "3일 비교표가 업데이트됐습니다. OneDrive에서 확인하세요",
+    )
 
 
 if __name__ == "__main__":
