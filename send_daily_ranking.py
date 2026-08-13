@@ -61,6 +61,17 @@
    후에는 표 내용을 그대로 옮겨 적지 않고, "3일 비교표가 업데이트됐습니다. OneDrive에서
    확인하세요"라는 짧은 안내 메시지 1개만 카카오톡으로 보낸다. 이 기능은 5~7번 기존 로직을
    전혀 수정하지 않고 별도 함수로만 추가되어 있다.
+9. 3일 비교표의 각 시트에서, 현재 표시된 날짜 전부(최대 3일, 그보다 적으면 있는 날짜 수만큼)에
+   빠짐없이 등장하는 종목(등락률/수치는 무시하고 종목명만 비교)이 있으면, 그 종목이 나온 모든
+   셀을 노란색 계열(ALL_DATES_MATCH_FILL)로 칠한다(highlight_stocks_in_every_date()).
+10. 거래대금상위 시트에는 8번의 날짜별 표(순위 열 포함)를 전혀 건드리지 않고, 그 오른쪽에 한 칸
+   띄워 "전일 | 종목명" 미니 표를 추가로 그린다(add_value_top20_rank_table()).
+   오늘 거래대금상위(ka10032) TOP20을 기준으로 하며, "전일" 열 값은 format_rank_change()가
+   ▲▼ 표시를 만들 때 이미 쓰는 것과 같은 pred_rank 필드를 그대로 재사용한다(CSV 로그에는
+   없는 값이라 이번 실행에서 조회한 값을 그대로 쓴다). "전일" 열은 숫자만 들어가므로
+   PRED_RANK_COLUMN_WIDTH 고정 너비로 좁게 두고 가운데 정렬한다. 이 종목이 오늘의
+   실시간종목조회순위(ka00198) TOP20에도 있으면 그 행 전체를 9번과는 다른 색
+   (INQUIRY_OVERLAP_FILL)으로 칠한다.
 """
 
 import csv
@@ -70,7 +81,7 @@ import unicodedata
 from datetime import datetime
 
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Font
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 # 아래 세 모듈은 오늘 이미 만들어둔 스크립트를 그대로 import해서 재사용한다.
@@ -406,6 +417,14 @@ TITLE_ALIGNMENT = Alignment(horizontal="center", vertical="center")
 # 순위 열(A열)의 1~20 숫자를 가운데 정렬하기 위한 스타일 (날짜 열의 종목명/등락률 값은 그대로 둔다)
 RANK_ALIGNMENT = Alignment(horizontal="center", vertical="center")
 
+# 현재 표시된 날짜 전부(최대 3일, 부족하면 있는 날짜 수만큼)에 빠짐없이 등장하는 종목의
+# 셀을 칠할 배경색(노란색 계열). 등락률/수치는 무시하고 종목명만 비교해서 판단한다.
+ALL_DATES_MATCH_FILL = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+
+# 거래대금상위 시트의 "전일/종목명" 미니 표에서, 오늘 실시간조회순위 TOP20에도
+# 들어있는 종목의 행을 칠할 배경색. ALL_DATES_MATCH_FILL(노란색)과 구분되는 색을 쓴다.
+INQUIRY_OVERLAP_FILL = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+
 
 def merge_title_row(ws, last_col: int) -> None:
     """
@@ -426,16 +445,50 @@ def merge_title_row(ws, last_col: int) -> None:
     ws.cell(row=TITLE_ROW, column=1).alignment = TITLE_ALIGNMENT
 
 
-def fill_comparison_sheet(ws, category: str, rows: list) -> None:
+def highlight_stocks_in_every_date(ws, snapshots: dict, dates: list) -> None:
+    """
+    현재 표시된 날짜(dates, 최대 3일 - 부족하면 있는 날짜 수만큼) 전부에 빠짐없이 등장하는
+    종목이 있으면, 그 종목이 나온 모든 셀을 ALL_DATES_MATCH_FILL(노란색 계열)로 칠한다.
+
+    날짜별로 순위가 달라져도(같은 종목이 날짜마다 다른 행에 있어도) 종목명만 기준으로
+    비교한다(등락률/수치는 무시). 날짜가 하나뿐이면 "매번 등장"이 항상 참이 되어 의미가
+    없으므로, 그 경우에는 아무것도 칠하지 않는다.
+    """
+    if len(dates) < 2:
+        return
+
+    name_sets = [
+        {it.get("종목명", "") for it in snapshots[d]} - {""}
+        for d in dates
+    ]
+    common_names = set.intersection(*name_sets)
+    if not common_names:
+        return
+
+    for col, d in enumerate(dates, start=2):
+        for item in snapshots[d]:
+            if item.get("종목명", "") not in common_names:
+                continue
+            data_row = TABLE_HEADER_ROW + int(item["순위"])
+            ws.cell(row=data_row, column=col).fill = ALL_DATES_MATCH_FILL
+
+
+def fill_comparison_sheet(ws, category: str, rows: list) -> int:
     """
     카테고리 하나에 대해, 1행에는 "{category} 3일 비교표" 제목을 큰 글씨로 넣고 표의 마지막
     열까지 병합·가운데 정렬하며, 그 아래(2행부터)에 최근 3개 날짜(하루 중 가장 나중 기록
     기준)를 열로, 순위 1~TOP_N을 행으로 하는 표를 시트에 채운다. 각 셀은 "종목명(값)"
     형식으로 채운다(값의 단위는 format_comparison_value가 카테고리에 맞게 결정한다).
+    표시된 날짜 전부에 빠짐없이 등장하는 종목은 highlight_stocks_in_every_date()가 노란색
+    계열로 표시한다.
 
     ws는 매번 새로 만드는 게 아니라 기존 파일에서 재사용하는 시트일 수 있어서, 표 영역 밖의
     다른 셀(사람이 추가한 메모 등)이나 셀 서식은 건드리지 않고, 제목/표 영역의 "값"만 최신
     CSV 기준으로 덮어쓴다.
+
+    반환값(표의 마지막 열 번호, 순위 열 포함)은 거래대금상위 시트에서 이 표를 건드리지 않고
+    그 오른쪽에 별도 미니 표를 이어 붙일 때(add_value_top20_rank_table) 시작 열을 정하는 데
+    쓰인다.
     """
     ws.cell(row=TITLE_ROW, column=1, value=f"{category} 3일 비교표").font = TITLE_FONT
 
@@ -459,15 +512,85 @@ def fill_comparison_sheet(ws, category: str, rows: list) -> None:
             value = format_comparison_value(category, item.get("등락률", ""))
             ws.cell(row=data_row, column=col, value=f"{name}({value})")
 
-    merge_title_row(ws, last_col=1 + len(dates))
+    highlight_stocks_in_every_date(ws, snapshots, dates)
+
+    last_col = 1 + len(dates)
+    merge_title_row(ws, last_col=last_col)
     autosize_columns(ws)
+    return last_col
 
 
-def save_three_day_comparison_excel(rows: list, path: str = COMPARISON_EXCEL_PATH) -> None:
+# 거래대금상위 시트에서 기존 3일비교 표와 새 미니 표(전일/종목명) 사이에 띄울 빈 열 수.
+# 기존 표를 절대 건드리지 않기 위해, 표의 마지막 열 바로 옆이 아니라 한 칸 띄워서 시작한다.
+VALUE_RANK_TABLE_GAP = 1
+
+VALUE_RANK_TABLE_HEADERS = ["전일", "종목명"]
+
+# "전일" 열(숫자만 들어감)은 순위 열(A열)처럼 내용 기준 자동계산 없이 좁은 고정 너비를 쓴다.
+PRED_RANK_COLUMN_WIDTH = 5
+
+
+def add_value_top20_rank_table(ws, value_top_today: list, inquiry_top_today: list, start_col: int) -> None:
+    """
+    거래대금상위 시트에서 기존 3일비교 표(날짜별 표, fill_comparison_sheet가 채움)는 전혀
+    건드리지 않고, start_col부터 "전일순위 | 종목명" 미니 표를 새로 그린다.
+
+    오늘 거래대금상위(ka10032) TOP20인 value_top_today를 기준으로 하고, "전일" 열 값은
+    format_rank_change()가 ▲▼ 표시를 만들 때 이미 쓰고 있는 것과 같은 ka10032 응답 필드인
+    pred_rank를 그대로 재사용한다. (오늘순위는 어차피 TOP20 순번과 같아 별도 열로 보여줄
+    필요가 없어 뺐다.) "전일" 열은 숫자만 들어가므로 순위 열(A열)처럼 PRED_RANK_COLUMN_WIDTH
+    고정 너비를 쓰고, 값은 가로/세로 가운데 정렬한다.
+
+    이 종목이 오늘의 실시간종목조회순위(ka00198) TOP20인 inquiry_top_today에도 있으면,
+    그 행 전체를 INQUIRY_OVERLAP_FILL로 칠해 구분한다(①번 셀 강조인 ALL_DATES_MATCH_FILL과는
+    다른 색).
+
+    ws는 매번 새로 만드는 게 아니라 기존 파일에서 재사용하는 시트일 수 있어서(예: 이전
+    실행 때는 미니 표 열 구성이 지금과 달랐던 경우), start_col부터 이전에 이 표가 차지했을
+    수 있는 열까지 먼저 값/배경색을 지워 오래된 열이 새 표 옆에 그대로 남지 않게 한다.
+    """
+    max_row_to_clear = TABLE_HEADER_ROW + TOP_N
+    max_col_to_clear = max(ws.max_column, start_col + len(VALUE_RANK_TABLE_HEADERS) - 1)
+    for row in range(TABLE_HEADER_ROW, max_row_to_clear + 1):
+        for col in range(start_col, max_col_to_clear + 1):
+            cell = ws.cell(row=row, column=col)
+            cell.value = None
+            cell.fill = PatternFill(fill_type=None)
+
+    inquiry_names_today = {it.get("stk_nm", "") for it in inquiry_top_today}
+
+    for col_offset, header in enumerate(VALUE_RANK_TABLE_HEADERS):
+        ws.cell(row=TABLE_HEADER_ROW, column=start_col + col_offset, value=header)
+
+    for i, item in enumerate(value_top_today, start=1):
+        data_row = TABLE_HEADER_ROW + i
+        name = item.get("stk_nm", "")
+        pred_rank_cell = ws.cell(row=data_row, column=start_col, value=item.get("pred_rank", ""))
+        pred_rank_cell.alignment = RANK_ALIGNMENT
+        cells = [
+            pred_rank_cell,
+            ws.cell(row=data_row, column=start_col + 1, value=name),
+        ]
+        if name in inquiry_names_today:
+            for cell in cells:
+                cell.fill = INQUIRY_OVERLAP_FILL
+
+    autosize_columns(ws)
+    ws.column_dimensions[get_column_letter(start_col)].width = PRED_RANK_COLUMN_WIDTH
+
+
+def save_three_day_comparison_excel(
+    rows: list,
+    value_top_today: list,
+    inquiry_top_today: list,
+    path: str = COMPARISON_EXCEL_PATH,
+) -> None:
     """
     기존 3개 카카오톡 메시지(TOP20) 전송과는 별개로, 카테고리별로 시트를 나눈 3일 비교표를
     엑셀 파일로 만들어 OneDrive에 저장한다. 기존 조회/전송 로직에는 전혀 관여하지 않고
-    CSV 로그를 다시 읽어들이는 것만으로 동작한다.
+    CSV 로그를 다시 읽어들이는 것만으로 동작한다(단, 거래대금상위 시트의 미니 표는 CSV가
+    아니라 이번 실행에서 막 조회한 value_top_today/inquiry_top_today를 그대로 쓴다 - now_rank/
+    pred_rank는 CSV 로그에 남지 않는 값이기 때문).
 
     파일이 이미 있으면 매번 새로 만들지 않고 load_workbook()으로 열어서 재사용한다.
     사람이 엑셀 파일에서 직접 서식을 바꾸거나 메모를 남기거나 시트를 추가해 두었어도,
@@ -485,7 +608,12 @@ def save_three_day_comparison_excel(rows: list, path: str = COMPARISON_EXCEL_PAT
 
     for category in ("실시간종목조회순위", "거래대금상위", "시가총액상위"):
         ws = get_or_create_sheet(workbook, category)
-        fill_comparison_sheet(ws, category, rows)
+        last_col = fill_comparison_sheet(ws, category, rows)
+        if category == "거래대금상위":
+            add_value_top20_rank_table(
+                ws, value_top_today, inquiry_top_today,
+                start_col=last_col + 1 + VALUE_RANK_TABLE_GAP,
+            )
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     workbook.save(path)
@@ -545,7 +673,11 @@ def main():
     # (data/daily_ranking_log.csv를 다시 읽어들여 만들며, 위 7번까지의 동작에는 영향을 주지 않는다)
     # 표 내용을 옮겨 적는 대신 업데이트 사실만 짧게 카카오톡으로 알린다
     comparison_rows = load_ranking_log_rows()
-    save_three_day_comparison_excel(comparison_rows)
+    save_three_day_comparison_excel(
+        comparison_rows,
+        value_top_today=vv["ka10032"],
+        inquiry_top_today=vv["ka00198"],
+    )
     send_category_message(
         kakao_token, "3일비교표 업데이트 알림",
         "3일 비교표가 업데이트됐습니다. OneDrive에서 확인하세요",
