@@ -72,6 +72,16 @@
    PRED_RANK_COLUMN_WIDTH 고정 너비로 좁게 두고 가운데 정렬한다. 이 종목이 오늘의
    실시간종목조회순위(ka00198) TOP20에도 있으면 그 행 전체를 9번과는 다른 색
    (INQUIRY_OVERLAP_FILL)으로 칠한다.
+11. 같은 엑셀 파일에 "전체이력" 시트를 하나 더 두어(fill_full_history_sheet()), 8번 3일비교
+   표와 같은 형식(순위 1~TOP_N을 행으로, 날짜를 열로)이되 최근 3일이 아니라 CSV 로그에
+   남아있는 전체 날짜를 보여준다. 카테고리별로 시트를 나누는 8번과 달리 이 시트 하나 안에서
+   실시간종목조회순위/거래대금상위 두 카테고리 표를 옆으로 나란히 배치하고, 순위 1~TOP_N은
+   두 카테고리가 동일하므로 순위 열(A열)을 공유한다. 날짜가 늘어날수록 옆으로 계속 넓어지므로
+   1~2행(카테고리 제목/날짜 헤더)과 A열(순위)을 틀 고정(freeze_panes)해 옆으로 스크롤해도
+   순위와 날짜가 계속 보이게 한다. 이 시트도 실행마다 CSV 로그 최신 상태로 통째로 다시
+   그려진다(clear_sheet()로 이전 실행의 흔적을 지운 뒤 새로 채운다 - 날짜 수가 매번 달라져
+   카테고리 블록의 열 폭이 바뀌기 때문). 8~10번의 3개 시트(및 3일비교 관련 로직)는 전혀
+   건드리지 않는다.
 """
 
 import csv
@@ -579,6 +589,84 @@ def add_value_top20_rank_table(ws, value_top_today: list, inquiry_top_today: lis
     ws.column_dimensions[get_column_letter(start_col)].width = PRED_RANK_COLUMN_WIDTH
 
 
+# "전체이력" 시트 이름과, 그 안에서 다룰 카테고리(시가총액상위는 포함하지 않는다).
+FULL_HISTORY_SHEET_NAME = "전체이력"
+FULL_HISTORY_CATEGORIES = ("실시간종목조회순위", "거래대금상위")
+
+# "전체이력" 시트에서 카테고리 블록(날짜 열들) 사이에 띄울 빈 열 수.
+FULL_HISTORY_BLOCK_GAP = 1
+
+
+def clear_sheet(ws) -> None:
+    """
+    시트의 모든 셀 값/배경색과 병합 범위를 지운다.
+
+    "전체이력" 시트는 실행마다 CSV에 쌓인 날짜 수가 늘어나 카테고리별 블록의 열 폭이 매번
+    달라지므로(add_value_top20_rank_table이 미니 표를 매번 지우고 다시 그리는 것과 같은
+    이유), 새로 채우기 전에 이전 실행의 흔적을 통째로 지워야 지난 실행 때 더 넓었던 블록의
+    오래된 열이 새 표 옆에 그대로 남지 않는다.
+    """
+    for merged_range in list(ws.merged_cells.ranges):
+        ws.unmerge_cells(str(merged_range))
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.value = None
+            cell.fill = PatternFill(fill_type=None)
+
+
+def fill_full_history_sheet(ws, rows: list) -> None:
+    """
+    "전체이력" 시트를 채운다. fill_comparison_sheet(3일비교)와 같은 "날짜를 열로, 순위
+    1~TOP_N을 행으로" 하는 형식이지만, 최근 3개 날짜가 아니라 CSV 로그에 남아있는 전체
+    날짜를 다 보여준다(latest_snapshot_per_date로 날짜별 가장 나중 기록만 쓰는 것은 동일).
+
+    카테고리별로 시트를 따로 만드는 3일비교와 달리, 이 시트 하나 안에서
+    FULL_HISTORY_CATEGORIES(실시간종목조회순위/거래대금상위) 두 카테고리 표를 옆으로 나란히
+    배치한다(카테고리 사이는 FULL_HISTORY_BLOCK_GAP만큼 빈 열로 띄운다). 순위 1~TOP_N은 두
+    카테고리 모두 동일하게 반복되므로 순위 열(A열)은 한 번만 두고 두 카테고리가 공유한다 -
+    그래야 "A열 고정" 하나만으로 옆으로 스크롤해도 두 표 모두에서 순위 번호가 계속 보인다.
+    같은 이유로 카테고리 제목(1행)과 날짜 헤더(2행)도 이 함수를 호출한 뒤 main()에서
+    ws.freeze_panes = "B3"로 고정한다(1~2행 + A열).
+    """
+    clear_sheet(ws)
+
+    ws.cell(row=TABLE_HEADER_ROW, column=1, value="순위")
+    for rank in range(1, TOP_N + 1):
+        ws.cell(row=TABLE_HEADER_ROW + rank, column=1, value=rank).alignment = RANK_ALIGNMENT
+
+    start_col = 2
+    for category in FULL_HISTORY_CATEGORIES:
+        snapshots = latest_snapshot_per_date(rows, category)
+        dates = sorted(snapshots.keys())  # 전체 날짜, 오래된 -> 최신 순 (3일 제한 없음)
+        if not dates:
+            continue
+
+        end_col = start_col + len(dates) - 1
+        ws.cell(row=TITLE_ROW, column=start_col, value=f"{category} 전체이력").font = TITLE_FONT
+        if end_col > start_col:
+            ws.merge_cells(start_row=TITLE_ROW, start_column=start_col, end_row=TITLE_ROW, end_column=end_col)
+        ws.cell(row=TITLE_ROW, column=start_col).alignment = TITLE_ALIGNMENT
+
+        for col, d in enumerate(dates, start=start_col):
+            date_label = datetime.strptime(d, "%Y-%m-%d").strftime("%m/%d")
+            ws.cell(row=TABLE_HEADER_ROW, column=col, value=date_label)
+
+        for rank in range(1, TOP_N + 1):
+            data_row = TABLE_HEADER_ROW + rank
+            for col, d in enumerate(dates, start=start_col):
+                item = next((it for it in snapshots[d] if int(it["순위"]) == rank), None)
+                if item is None:
+                    continue
+                name = item.get("종목명", "")
+                value = format_comparison_value(category, item.get("등락률", ""))
+                ws.cell(row=data_row, column=col, value=f"{name}({value})")
+
+        start_col = end_col + 1 + FULL_HISTORY_BLOCK_GAP
+
+    autosize_columns(ws)
+    ws.freeze_panes = "B3"
+
+
 def save_three_day_comparison_excel(
     rows: list,
     value_top_today: list,
@@ -599,6 +687,11 @@ def save_three_day_comparison_excel(
     내용이 다음 실행 때 사라지지 않는다. 다만 표 영역 안의 셀 값(종목명/등락률 등)은
     CSV의 최신 조회 결과를 그대로 반영해야 하므로, 그 부분을 사람이 직접 고쳐도 다음
     실행 때 다시 최신 값으로 덮어써진다.
+
+    위 3개 카테고리 시트와는 별개로 "전체이력" 시트(FULL_HISTORY_SHEET_NAME)도 이 안에서
+    함께 채운다(fill_full_history_sheet()). 다만 이 시트는 표 영역 "값"만 부분적으로
+    덮어쓰는 3개 카테고리 시트와 달리, 매번 clear_sheet()로 시트 전체를 지운 뒤 새로
+    그린다(날짜가 늘어날수록 카테고리 블록의 열 폭이 매번 달라지기 때문).
     """
     if os.path.exists(path):
         workbook = load_workbook(path)
@@ -614,6 +707,8 @@ def save_three_day_comparison_excel(
                 ws, value_top_today, inquiry_top_today,
                 start_col=last_col + 1 + VALUE_RANK_TABLE_GAP,
             )
+
+    fill_full_history_sheet(get_or_create_sheet(workbook, FULL_HISTORY_SHEET_NAME), rows)
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     workbook.save(path)
