@@ -9,6 +9,9 @@ from dotenv import load_dotenv, set_key
 
 import send_kakao_message as kakao
 
+# Windows 콘솔(cp949) 환경에서 한글/특수문자 출력 시 깨지는 것을 방지
+sys.stdout.reconfigure(encoding="utf-8")
+
 load_dotenv()
 ENV_PATH = ".env"
 
@@ -16,6 +19,7 @@ APP_KEY = os.getenv("KIWOOM_APP_KEY")
 SECRET_KEY = os.getenv("KIWOOM_SECRET_KEY")
 ACCESS_TOKEN = os.getenv("KIWOOM_ACCESS_TOKEN")
 KAKAO_ACCESS_TOKEN = os.getenv("KAKAO_ACCESS_TOKEN")
+ACCOUNT_NO = os.getenv("KIWOOM_ACCOUNT_NO", "")
 
 BASE_URL = "https://api.kiwoom.com"
 KAKAO_MEMO_URL = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
@@ -38,6 +42,8 @@ def get_today_executions():
         "api-id": "kt00007",
     }
     today = datetime.now().strftime("%Y%m%d")
+    # kt00007은 request body/header 어디에도 계좌번호 파라미터가 없다. 앱키/시크릿으로 발급받은
+    # ACCESS_TOKEN 자체가 계좌 1개에 종속되어 있어, 조회 대상 계좌는 그 토큰으로 결정된다.
     payload = {
         "ord_dt": today,
         "qry_tp": "1",
@@ -97,10 +103,10 @@ def append_log(executions):
     with open(LOG_FILE, "a", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(["체결시각", "종목명", "매수매도", "체결가", "체결수량", "체결번호"])
+            writer.writerow(["계좌번호", "체결시각", "종목명", "매수매도", "체결가", "체결수량", "체결번호"])
         for e in executions:
             writer.writerow([
-                e.get("cntr_tm", ""), e.get("stk_nm", ""), e.get("sell_tp", ""),
+                ACCOUNT_NO, e.get("cntr_tm", ""), e.get("stk_nm", ""), e.get("sell_tp", ""),
                 e.get("cntr_pric", ""), e.get("cntr_qty", ""), e.get("ord_no", ""),
             ])
 
