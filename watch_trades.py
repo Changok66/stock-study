@@ -8,6 +8,7 @@ from datetime import datetime, time as dtime
 from dotenv import load_dotenv, set_key
 
 import send_kakao_message as kakao
+import update_trading_journal
 
 # Windows 콘솔(cp949) 환경에서 한글/특수문자 출력 시 깨지는 것을 방지
 sys.stdout.reconfigure(encoding="utf-8")
@@ -100,13 +101,14 @@ def save_seen_ids(ids):
 def append_log(executions):
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     file_exists = os.path.exists(LOG_FILE)
+    today = datetime.now().strftime("%Y-%m-%d")
     with open(LOG_FILE, "a", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(["계좌번호", "체결시각", "종목명", "매수매도", "체결가", "체결수량", "체결번호"])
+            writer.writerow(["계좌번호", "날짜", "체결시각", "종목명", "매수매도", "체결가", "체결수량", "체결번호"])
         for e in executions:
             writer.writerow([
-                ACCOUNT_NO, e.get("cntr_tm", ""), e.get("stk_nm", ""), e.get("sell_tp", ""),
+                ACCOUNT_NO, today, e.get("cntr_tm", ""), e.get("stk_nm", ""), e.get("sell_tp", ""),
                 e.get("cntr_pric", ""), e.get("cntr_qty", ""), e.get("ord_no", ""),
             ])
 
@@ -152,6 +154,12 @@ def check_once():
     append_log(new_ones)
     save_seen_ids(seen)
     print(f"[완료] 새 체결 {len(new_ones)}건 처리")
+
+    # 매매일지 갱신 실패가 체결 감지/카카오 알림 자체를 막아서는 안 되므로 예외를 잡아둔다.
+    try:
+        update_trading_journal.update_journal(account_no=ACCOUNT_NO)
+    except Exception as e:
+        print(f"[WARN] 매매일지 갱신 중 오류가 발생했습니다: {e}")
 
 
 def main():
