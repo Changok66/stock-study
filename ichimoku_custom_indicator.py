@@ -12,7 +12,19 @@ data/samsung.csv를 읽어 커스텀 일목균형표 지표인 엔상(N상)/엔�
 - 1선: 후행스팬 = 종가를 LAG일만큼 앞당겨 표시한 값 (Close.shift(-LAG))       → 단순 선
 - 2,3,4,5선: 엔상과 같은 방식이되 ATR 폭을 더해주는 대신 빼준다 (아래로 벌어짐)
 
-ATR은 backtest.py의 compute_adx()와 동일하게 Wilder 지수평활(alpha=1/period)로 계산한다.
+ATR은 True Range의 단순 rolling mean(SMA)으로 계산한다
+(backtest.py의 compute_adx()가 쓰는 Wilder 지수평활과는 다른 방식).
+
+--- 2026-08-14 영웅문 검증 기록 ---
+- 이 지표는 영웅문 표준 내장 지표가 아니라, 사용자가 EnvelopeUp을 ATR 기반으로
+  직접 변형한 커스텀 지표다.
+- 공식 구조(MA ± AVG(ATR,N)×FACTOR×배수)는 검증됨: 2026-07-14 기준 영웅문 실측치와
+  비교했을 때 1선(17이평)~피보/역피보는 오차 1% 이내, 배수가 큰 4·5선까지 포함해도
+  오차 1~7% 범위였다.
+- 영웅문 쪽 "Percent" 파라미터는 이 지표에서 사용되지 않는다(원/절대값 기준 밴드).
+- 남은 오차(주로 4·5선)는 영웅문 내부의 AVG/ATR 계산 디테일(예: rolling 평균을
+  몇 단계 거치는지 등) 차이로 추정되며 확정하지 못했다. 아래 계산값은 참고용
+  근사치이며, 영웅문 실제 표시값과는 소폭 차이가 있을 수 있다.
 """
 
 import pandas as pd
@@ -46,7 +58,6 @@ LINE_SPECS = [
 COLOR_CLOSE = "#2a78d6"      # 종가 (slot 1)
 COLOR_EN_SANG = "#eb6834"    # 엔상 계열 (slot 2, fibo_indicator.py의 피보 구름과 동일 관례)
 COLOR_EN_HA = "#4a3aa7"      # 엔하 계열 (slot 7, fibo_indicator.py의 역피보 구름과 동일 관례)
-COLOR_CHIKOU = "#1baf7a"     # 엔하1선(후행스팬) (slot 3)
 COLOR_SURFACE = "#fcfcfb"
 COLOR_PRIMARY_INK = "#0b0b0b"
 COLOR_MUTED = "#898781"
@@ -65,8 +76,7 @@ def load_data(path: str) -> pd.DataFrame:
 def add_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.DataFrame:
     """
     ATR(Average True Range)을 계산한다.
-    backtest.py의 compute_adx()와 동일하게 True Range를 Wilder 방식으로
-    지수평활(alpha=1/period, adjust=False인 EWM과 수학적으로 동일)한다.
+    True Range의 단순 rolling mean(SMA)을 사용한다.
     """
     high, low, close = df["High"], df["Low"], df["Close"]
     prev_close = close.shift(1)
@@ -75,7 +85,7 @@ def add_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.DataFrame:
         (high - prev_close).abs(),
         (low - prev_close).abs(),
     ], axis=1).max(axis=1)
-    df["ATR"] = tr.ewm(alpha=1 / period, adjust=False).mean()
+    df["ATR"] = tr.rolling(window=period).mean()
     return df
 
 
@@ -129,8 +139,7 @@ def plot_ichimoku_custom(df: pd.DataFrame, output_path: str):
     ax.plot(df["Date"], df["엔상2선"], color=COLOR_EN_SANG, linewidth=1.0, linestyle="--", alpha=0.85, label="엔상2선", zorder=2)
     ax.plot(df["Date"], df["엔상3선"], color=COLOR_EN_SANG, linewidth=1.0, linestyle=":", alpha=0.85, label="엔상3선", zorder=2)
 
-    # 엔하 1~3선
-    ax.plot(df["Date"], df["엔하1선"], color=COLOR_CHIKOU, linewidth=1.8, label="엔하1선 (후행스팬)", zorder=2)
+    # 엔하 2~3선 (1선인 후행스팬은 차트에서 제외)
     ax.plot(df["Date"], df["엔하2선"], color=COLOR_EN_HA, linewidth=1.0, linestyle="--", alpha=0.85, label="엔하2선", zorder=2)
     ax.plot(df["Date"], df["엔하3선"], color=COLOR_EN_HA, linewidth=1.0, linestyle=":", alpha=0.85, label="엔하3선", zorder=2)
 
