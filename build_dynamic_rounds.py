@@ -78,19 +78,40 @@ def split_stock_rows_into_rounds(rows):
         }
 
         if current is None:
-            current = {"종목명": row.get("종목명", ""), "fills": []}
+            current = {"종목명": row.get("종목명", ""), "fills": [], "in_progress": False}
         current["fills"].append(fill)
 
         position += qty if is_buy else -qty
         if position <= 0:
+            current["in_progress"] = False
             rounds.append(current)
             current = None
             position = 0
 
     if current is not None:
+        current["in_progress"] = True
         rounds.append(current)
 
     return rounds
+
+
+def _moving_average_buy_price(fills):
+    """체결 순서 그대로 이동평균법을 적용해 매입가 평단가를 계산한다.
+
+    매수 시: 평균단가 = (기존평균×기존수량 + 신규단가×신규수량) / (기존+신규수량)
+    매도 시: 수량만 줄고 평균단가는 그대로 유지.
+    """
+    avg = 0.0
+    qty = 0
+    for fill in fills:
+        if fill["is_buy"]:
+            new_qty = qty + fill["qty"]
+            if new_qty > 0:
+                avg = (avg * qty + fill["price"] * fill["qty"]) / new_qty
+            qty = new_qty
+        else:
+            qty -= fill["qty"]
+    return avg
 
 
 def build_rounds(csv_rows):
@@ -284,6 +305,12 @@ def write_round_block(ws, header_row, round_data, style):
         cell = ws[f"{col}{totals_row}"]
         cell.value = formula
         _apply_style(cell, style["totals"][col])
+
+    # 진행중(미완결) 라운드는 매수평단가를 단순평균이 아니라 이동평균법으로 덮어쓴다.
+    if round_data.get("in_progress"):
+        f_cell = ws[f"F{totals_row}"]
+        f_cell.value = _moving_average_buy_price(round_data["fills"])
+        _apply_style(f_cell, style["totals"]["F"])
 
     return totals_row + 1 + BLOCK_GAP_ROWS
 
