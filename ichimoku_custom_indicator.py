@@ -1,12 +1,13 @@
 """
-data/samsung.csv를 읽어 커스텀 일목균형표 지표인 엔상(N상)/엔하(N하)를 계산하고,
+data/samsung.csv를 읽어 커스텀 일목균형표 지표인 엔상(N상)/엔하(N하), 그리고
+현재 위치 기준 선행스팬인 선1/선2(양운/음운 판정용)를 계산하고,
 종가 위에 시각화하는 스크립트.
 
 엔상(N상):
-- 1선: MA(종가, PERIOD)                                           → 단순 선
-- 2선: shift(MA(종가, PERIOD) + AVG(ATR(ATR_PERIOD), 10) × FACTOR,       AA) → 단순 선
-- 3선: shift(MA(종가, PERIOD) + AVG(ATR(ATR_PERIOD), 20) × FACTOR × 2,   AA) → 단순 선
-- 4,5선: shift(MA(종가, PERIOD) + AVG(ATR(ATR_PERIOD), 20) × FACTOR × 3/4, AA) → 그 사이를 채운 구름대
+- 1선: MA(종가, PERIOD)                                     → 단순 선
+- 2선: MA(종가, PERIOD) + AVG(ATR(ATR_PERIOD), 10) × FACTOR       → 단순 선
+- 3선: MA(종가, PERIOD) + AVG(ATR(ATR_PERIOD), 20) × FACTOR × 2   → 단순 선
+- 4,5선: MA(종가, PERIOD) + AVG(ATR(ATR_PERIOD), 20) × FACTOR × 3/4 → 그 사이를 채운 구름대
 
 엔하(N하):
 - 1선: 후행스팬 = 종가를 LAG일만큼 앞당겨 표시한 값 (Close.shift(-LAG))       → 단순 선
@@ -15,20 +16,15 @@ data/samsung.csv를 읽어 커스텀 일목균형표 지표인 엔상(N상)/엔�
 ATR은 True Range의 단순 rolling mean(SMA)으로 계산한다
 (backtest.py의 compute_adx()가 쓰는 Wilder 지수평활과는 다른 방식).
 
---- 2026-08-14 영웅문 검증 기록 (data/kiwoom_indicator_reference.csv, 600일 비교) ---
-- 이 지표는 영웅문 표준 내장 지표가 아니라, 사용자가 EnvelopeUp을 ATR 기반으로
-  직접 변형한 커스텀 지표다.
-- 공식 구조(MA ± AVG(ATR,N)×FACTOR×배수)는 검증됨: 피보/역피보/1선(17이평)/
-  후행스팬은 600일 평균|오차| 1% 미만.
-- ATR 계산 방식 6가지(Wilder/SMA × 이중평균/단일평균)를 전부 비교한 결과,
-  지금 쓰는 "SMA14 -> SMA_N 이중평균"이 600일 평균|오차| 1.008%로 가장 정확했다
-  (2위 TR->SMA_N 1.054%, Wilder 계열은 1.46~1.99%로 더 부정확).
-- 영웅문 쪽 "Percent" 파라미터는 이 지표에서 사용되지 않는다(원/절대값 기준 밴드).
-- 엔상 라인은 항상 실측치보다 낮고 엔하 라인은 항상 실측치보다 좁게 나오는
-  일관된 편향이 있어, 8개 라인에서 역산한 implied FACTOR가 평균 1.095였다.
-  FACTOR=1.1로 적용한 뒤 600일 평균|오차|가 1.008% -> 0.757%로 더 줄었다.
-- 남은 오차(주로 4·5선, 최악의 날은 -5~+9%대)는 여전히 존재하며, 영웅문 내부의
-  세부 계산 디테일 차이로 추정된다. 아래 계산값은 참고용 근사치다.
+선1/선2 (일목 선행스팬, 현재 위치 - 미래로 미리 그리는 시프트 없음):
+- 선1: (HH(SPAN1_SHORT) + LL(SPAN1_SHORT) + HH(SPAN1_LONG) + LL(SPAN1_LONG)) / 4
+       = 두 기간(10일/25일)의 (최고가+최저가)/2 중간값을 다시 평균한 값
+- 선2: (HH(SPAN2_PERIOD) + LL(SPAN2_PERIOD)) / 2  (50일 최고가/최저가의 중간값)
+- 양운/음운: 선1 > 선2 이면 양운, 선1 < 선2 이면 음운 (backtest_multi.py의 매수 필터로 쓰인다)
+
+FACTOR=1(2026-08-19 기준): 엔상/엔하는 백테스트 전략에 쓰이지 않는 참고용 지표라
+영웅문 값과의 오차 보정(과거 FACTOR=1.1)은 걷어내고, 요청받은 원본 공식 그대로
+FACTOR=1을 쓴다.
 """
 
 import pandas as pd
@@ -45,8 +41,7 @@ OUTPUT_PATH = "data/samsung_ichimoku_custom.png"
 # --- 지표 파라미터 (요청 값 그대로) ---
 PERIOD = 17       # 기준 이동평균(MA) 기간, 엔상/엔하 공통
 ATR_PERIOD = 14   # ATR 계산 기간
-FACTOR = 1.1      # ATR 폭 계수 (600일 검증에서 역산한 implied factor 평균 1.095를 반영)
-AA = 0            # 2~5선 전체에 적용하는 시프트 (현재 0 = 시프트 없음)
+FACTOR = 1        # ATR 폭 계수
 LAG = 25          # 엔하 1선(후행스팬)에 사용하는 이동 일수
 
 # 2선은 AVG(ATR,10)×FACTOR×1, 3~5선은 AVG(ATR,20)×FACTOR×(2,3,4)
@@ -57,6 +52,11 @@ LINE_SPECS = [
     (4, 20, 3),
     (5, 20, 4),
 ]
+
+# --- 선1/선2(일목 선행스팬, 현재 위치) 파라미터 ---
+SPAN1_SHORT = 10   # 선1에 쓰는 짧은 쪽 기간 (HH10/LL10)
+SPAN1_LONG = 25    # 선1에 쓰는 긴 쪽 기간 (HH25/LL25)
+SPAN2_PERIOD = 50  # 선2 기간 (HH50/LL50)
 
 # 차트 색상 (팔레트 카테고리컬 슬롯: 1=blue, 2=orange, 3=aqua, 7=violet)
 COLOR_CLOSE = "#2a78d6"      # 종가 (slot 1)
@@ -94,9 +94,9 @@ def add_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.DataFrame:
 
 
 def _envelope_line(ma: pd.Series, atr: pd.Series, avg_window: int, multiplier: int, sign: int) -> pd.Series:
-    """shift(MA(종가, PERIOD) ± AVG(ATR(ATR_PERIOD), avg_window) × FACTOR × multiplier, AA)"""
+    """MA(종가, PERIOD) ± AVG(ATR(ATR_PERIOD), avg_window) × FACTOR × multiplier"""
     band = atr.rolling(window=avg_window).mean() * FACTOR * multiplier
-    return (ma + sign * band).shift(AA)
+    return ma + sign * band
 
 
 def add_en_sang(df: pd.DataFrame) -> pd.DataFrame:
@@ -114,6 +114,29 @@ def add_en_ha(df: pd.DataFrame) -> pd.DataFrame:
     df["엔하1선"] = df["Close"].shift(-LAG)
     for line_no, avg_window, multiplier in LINE_SPECS:
         df[f"엔하{line_no}선"] = _envelope_line(ma, df["ATR"], avg_window, multiplier, sign=-1)
+    return df
+
+
+def add_senkou_spans(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    선1/선2(일목 선행스팬, 현재 위치 - 미래로 미리 그리는 시프트 없음)와
+    그 대소 관계로 정하는 양운/음운 상태를 계산한다.
+
+    선1 = (HH(SPAN1_SHORT) + LL(SPAN1_SHORT) + HH(SPAN1_LONG) + LL(SPAN1_LONG)) / 4
+    선2 = (HH(SPAN2_PERIOD) + LL(SPAN2_PERIOD)) / 2
+    (HHn/LLn = 최근 n일 고가/저가의 최대값/최소값)
+    """
+    hh_short = df["High"].rolling(window=SPAN1_SHORT).max()
+    ll_short = df["Low"].rolling(window=SPAN1_SHORT).min()
+    hh_long = df["High"].rolling(window=SPAN1_LONG).max()
+    ll_long = df["Low"].rolling(window=SPAN1_LONG).min()
+    hh_span2 = df["High"].rolling(window=SPAN2_PERIOD).max()
+    ll_span2 = df["Low"].rolling(window=SPAN2_PERIOD).min()
+
+    df["선1"] = (hh_short + ll_short + hh_long + ll_long) / 4
+    df["선2"] = (hh_span2 + ll_span2) / 2
+    df["구름상태"] = df["선1"].gt(df["선2"]).map({True: "양운", False: "음운"})
+    df.loc[df["선1"].isna() | df["선2"].isna(), "구름상태"] = None
     return df
 
 
@@ -181,6 +204,7 @@ def main():
     df = add_atr(df)
     df = add_en_sang(df)
     df = add_en_ha(df)
+    df = add_senkou_spans(df)
 
     print(f"[INFO] 데이터 기간: {df['Date'].min().date()} ~ {df['Date'].max().date()}")
     print(f"[INFO] 계산된 컬럼: {list(df.columns)}")

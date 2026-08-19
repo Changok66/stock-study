@@ -35,16 +35,14 @@ def load_data(path: str) -> pd.DataFrame:
     return df
 
 
-def add_ema(df: pd.DataFrame) -> pd.DataFrame:
+def add_ma(df: pd.DataFrame) -> pd.DataFrame:
     """
-    종가(Close) 기준 지수이동평균(EMA)을 계산한다.
-    이름은 MA5/MA8/MA13이지만 단순이동평균(SMA)이 아니라
-    최근 데이터에 더 큰 가중치를 두는 지수이동평균(EMA)이다.
-    - span=n, adjust=False: 표준 EMA 재귀식(전일 EMA를 그대로 이어받는 방식)을 사용
+    종가(Close) 기준 단순이동평균(SMA)을 계산한다.
+    MA5/MA8/MA13은 각각 5일/8일/13일 구간 종가의 산술평균이다.
     """
-    df["MA5"] = df["Close"].ewm(span=5, adjust=False).mean()
-    df["MA8"] = df["Close"].ewm(span=8, adjust=False).mean()
-    df["MA13"] = df["Close"].ewm(span=13, adjust=False).mean()
+    df["MA5"] = df["Close"].rolling(window=5).mean()
+    df["MA8"] = df["Close"].rolling(window=8).mean()
+    df["MA13"] = df["Close"].rolling(window=13).mean()
     return df
 
 
@@ -203,8 +201,8 @@ def plot_fibo_cloud(df: pd.DataFrame, crossovers: pd.DataFrame, output_path: str
 def main():
     df = load_data(INPUT_PATH)
 
-    # 1. 지수이동평균(EMA)
-    df = add_ema(df)
+    # 1. 이동평균(SMA)
+    df = add_ma(df)
 
     # 2. 피보나치 지표
     df = add_fibo(df)

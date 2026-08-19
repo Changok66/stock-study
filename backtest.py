@@ -96,7 +96,7 @@ def prepare_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     골든크로스/데드크로스 지점과 ADX를 추가로 계산한다.
     """
     df = fi.load_data(fi.INPUT_PATH)
-    df = fi.add_ema(df)
+    df = fi.add_ma(df)
     df = fi.add_fibo(df)
     df = fi.add_bollinger_bands(df)
     df = fi.add_inverse_fibo(df)
