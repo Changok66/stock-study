@@ -65,9 +65,12 @@ def simulate_reserved_strategy(
     block_buy_on_g_inversion: bool = False,
     reduce_on_g_inversion: bool = False,
     atr_multiplier: float | None = None,
-) -> tuple[pd.Series, pd.DataFrame]:
+) -> tuple[pd.Series, pd.DataFrame, pd.DataFrame]:
     """
-    일별 mark-to-market 자산곡선(시작=1.0)과, 매도 체결마다의 실현수익률 내역을 반환한다.
+    일별 mark-to-market 자산곡선(시작=1.0), 매도 체결마다의 실현수익률 내역,
+    일별 진단 정보(비중/평단가/최고종가추적/다음날 예약비중변화/트리거 사유)를 반환한다.
+    세 번째 값(diagnostics_df)은 신호 알림 등 실전 연동에서 "오늘 신호가 떴는지,
+    내일 무엇이 체결될지"를 그대로 가져다 쓸 수 있도록 signal_generator.py가 사용한다.
 
     regime_guard=True이면, 4개 분할매수/매도 신호와 별개로 "양운(선1>선2)이 음운으로
     전환되는 날" 다음 거래일 시가에 남은 포지션을 전량(1/3 단위가 아니라 100%) 강제청산한다
@@ -122,6 +125,7 @@ def simulate_reserved_strategy(
 
     equity = [1.0] * n
     trades = []
+    diagnostics = []   # 일별 상태 스냅샷(신호 알림 등 실전 연동에서 쓸 수 있도록) - 항상 채운다
 
     for t in range(n):
         weight_overnight = current_weight
@@ -171,8 +175,20 @@ def simulate_reserved_strategy(
             intraday_factor = 1 + weight_after * (closes[t] / opens[t] - 1)
             equity[t] = equity[t - 1] * overnight_factor * fee_factor * intraday_factor
 
-        if t == 0 or t == n - 1:
-            continue  # 첫날은 전일 데이터가 없고, 마지막 날은 "다음날 시가"가 없어 신호를 실행할 수 없다
+        if t == 0:
+            diagnostics.append({
+                "Date": dates[t], "Close": closes[t], "비중": weight_after,
+                "매수평단가": round(avg_cost, 4) if weight_after > 0 else None,
+                "최고종가추적": highest_close, "예약비중변화": None, "트리거": None, "실효있음": False,
+            })
+            continue  # 첫날은 전일 데이터가 없어 신호를 계산할 수 없다
+
+        # 마지막 날(t == n-1)도 신호 계산 자체는 그대로 한다 - 트리거 판정은 그날/전날
+        # 종가만 있으면 되고 미래 데이터가 필요 없다(실행만 다음 거래일 시가가 필요할 뿐).
+        # 다만 반복문이 여기서 끝나 pending_delta를 "실행"할 t+1 이터레이션이 없으므로,
+        # 마지막 날의 신호는 이 함수의 equity/trades 결과에는 전혀 반영되지 않고
+        # diagnostics_df에만 "다음 거래일 시가에 예정된 신호"로 표시된다 - 이게 바로
+        # signal_generator.py가 "오늘자 신호"를 읽어오는 지점이다.
 
         close_t, close_prev = closes[t], closes[t - 1]
         up_t, up_prev = up_lower[t], up_lower[t - 1]
@@ -184,14 +200,19 @@ def simulate_reserved_strategy(
         if block_buy_on_g_inversion and g_inverted[t]:
             buy_allowed = False
 
+        buy1 = buy_allowed and pd.notna(up_t) and pd.notna(up_prev) and close_prev < up_prev and close_t >= up_t
+        buy2 = buy_allowed and pd.notna(g_t) and pd.notna(g_prev) and close_prev < g_prev and close_t >= g_t
+        sell1 = pd.notna(down_t) and pd.notna(down_prev) and close_prev < down_prev and close_t >= down_t
+        sell2 = pd.notna(s_t) and pd.notna(s_prev) and close_prev > s_prev and close_t <= s_t
+
         step_delta = 0.0
-        if buy_allowed and pd.notna(up_t) and pd.notna(up_prev) and close_prev < up_prev and close_t >= up_t:
+        if buy1:
             step_delta += STEP   # 1차 매수: Up구름 하단 지지 후 반등
-        if buy_allowed and pd.notna(g_t) and pd.notna(g_prev) and close_prev < g_prev and close_t >= g_t:
+        if buy2:
             step_delta += STEP   # 2차 매수: G라인 이탈 후 회복
-        if pd.notna(down_t) and pd.notna(down_prev) and close_prev < down_prev and close_t >= down_t:
+        if sell1:
             step_delta -= STEP   # 1차 매도: Down구름 상향 돌파
-        if pd.notna(s_t) and pd.notna(s_prev) and close_prev > s_prev and close_t <= s_t:
+        if sell2:
             step_delta -= STEP   # 2차 매도: S라인 돌파 후 재하락
 
         forced_exit = (
@@ -210,18 +231,50 @@ def simulate_reserved_strategy(
             and close_t <= highest_close - atr[t] * atr_multiplier
         )
 
+        leg_labels = []
+        if buy1:
+            leg_labels.append("1차매수(Up구름 반등)")
+        if buy2:
+            leg_labels.append("2차매수(G라인 회복)")
+        if sell1:
+            leg_labels.append("1차매도(Down구름 돌파)")
+        if sell2:
+            leg_labels.append("2차매도(S라인 재하락)")
+
         if atr_stop:
             pending_delta = -current_weight   # ATR 트레일링스탑: 전량 손절, 최우선 순위
+            trigger_label = "ATR트레일링스탑 손절"
         elif forced_exit:
             pending_delta = -current_weight   # 전량 강제청산
+            trigger_label = "선1/선2 전환 강제청산"
         elif g_inversion_enter:
             pending_delta = step_delta - STEP   # 평소 신호에 더해 비중 1/3 추가 축소(실행 시 0 아래로는 클립됨)
+            trigger_label = "+".join(leg_labels + ["G역전 비중축소"])
         else:
             pending_delta = step_delta
+            trigger_label = "+".join(leg_labels) if leg_labels else None
+
+        # 예약비중변화는 "오늘 신호가 원하는 변화량"이라 weight_after가 이미 0%/100%
+        # 근처면 다음날 실제 체결에서는 clip돼 아무 효과가 없을 수 있다(예: 보유가
+        # 0%인데 매도신호가 뜨는 경우). 이 값 자체는 백테스트 실행 로직(위)과 동일하게
+        # 그대로 두되, 진단용으로 "실제 체결 효과가 있는지"를 별도 필드로 계산해둔다 -
+        # signal_generator.py가 이 필드로 무의미한 알림을 걸러낼 수 있게 하기 위함.
+        prospective_weight = min(max(weight_after + pending_delta, 0.0), MAX_WEIGHT)
+        has_effect = abs(prospective_weight - weight_after) > 1e-9
+
+        diagnostics.append({
+            "Date": dates[t], "Close": closes[t], "비중": weight_after,
+            "매수평단가": round(avg_cost, 4) if weight_after > 0 else None,
+            "최고종가추적": highest_close,
+            "예약비중변화": round(pending_delta, 4) if pending_delta else 0.0,
+            "트리거": trigger_label,
+            "실효있음": has_effect if trigger_label else False,
+        })
 
     equity_series = pd.Series(equity, index=pd.DatetimeIndex(dates))
     trades_df = pd.DataFrame(trades)
-    return equity_series, trades_df
+    diagnostics_df = pd.DataFrame(diagnostics)
+    return equity_series, trades_df, diagnostics_df
 
 
 def summarize_strategy(df: pd.DataFrame, equity: pd.Series, trades_df: pd.DataFrame, label: str) -> dict:
@@ -308,7 +361,7 @@ def run_final_comparison(df: pd.DataFrame) -> pd.DataFrame:
 
     rows = []
     for label, kwargs in variants:
-        equity, trades_df = simulate_reserved_strategy(df, **kwargs)
+        equity, trades_df, _ = simulate_reserved_strategy(df, **kwargs)
 
         full_row = summarize_strategy(df, equity, trades_df, label)
         full_row["구간"] = "전체기간(2010~2026)"
@@ -339,15 +392,15 @@ def main():
 
     run_final_comparison(df)
 
-    equity, trades_df = simulate_reserved_strategy(df, regime_guard=False)
-    equity_guard, trades_df_guard = simulate_reserved_strategy(df, regime_guard=True)
-    equity_guard2, trades_df_guard2 = simulate_reserved_strategy(
+    equity, trades_df, _ = simulate_reserved_strategy(df, regime_guard=False)
+    equity_guard, trades_df_guard, _ = simulate_reserved_strategy(df, regime_guard=True)
+    equity_guard2, trades_df_guard2, _ = simulate_reserved_strategy(
         df, regime_guard=True, block_buy_in_bear=True
     )
-    equity_g_block, trades_g_block = simulate_reserved_strategy(
+    equity_g_block, trades_g_block, _ = simulate_reserved_strategy(
         df, block_buy_on_g_inversion=True
     )
-    equity_g_reduce, trades_g_reduce = simulate_reserved_strategy(
+    equity_g_reduce, trades_g_reduce, _ = simulate_reserved_strategy(
         df, reduce_on_g_inversion=True
     )
 
