@@ -56,6 +56,8 @@ BEAR_PERIOD = ("2022-01-01", "2022-12-31")  # 하락장 방어력만 따로 확�
 SWEEP_MULTIPLIERS = [4, 5, 6, 8]   # whipsaw 손실과 하락장 방어 사이의 균형점을 찾기 위한 추가 스윕
 SWEEP_RESULTS_PATH = "data/backtest_soxl_trend_rolling_atrsweep.csv"
 
+TOUCH_MODE_RESULTS_PATH = "data/backtest_soxl_trend_rolling_touchmode.csv"
+
 
 def prepare_data() -> pd.DataFrame:
     """SOXL 가격 데이터를 읽어 엔상/엔하, 꼭지/바닥, 추세(MA17 5일 기울기)를 모두 계산한다."""
@@ -83,10 +85,25 @@ def prepare_data() -> pd.DataFrame:
     return df
 
 
+def _touch(close_prev: float, close_t: float, line_prev: float, line_t: float, from_above: bool) -> bool:
+    """
+    "터치" 판정. from_above=True면 전일에는 라인 위(또는 아래 라인이면 반대편)에 있다가
+    오늘 그 라인에 닿거나 넘는 "즉시터치"용 방향, from_above=False면 전일에는 반대편에
+    있다가 오늘 라인 쪽으로 돌아오는 "터치 후 반대방향 확인"용 방향이다. 두 경우 모두
+    라인 값이 NaN(위밍업 부족)이면 False.
+    """
+    if pd.isna(line_prev) or pd.isna(line_t):
+        return False
+    if from_above:
+        return close_prev > line_prev and close_t <= line_t
+    return close_prev < line_prev and close_t >= line_t
+
+
 def simulate_trend_rolling_strategy(
     df: pd.DataFrame,
     atr_multiplier: float | None = None,
     reduce_on_g_inversion: bool = False,
+    immediate_touch: bool = False,
 ) -> tuple[pd.Series, pd.DataFrame, float, float]:
     """
     일별 mark-to-market 자산곡선(시작=1.0)과 매도 체결마다의 실현수익률 내역을 반환한다.
@@ -106,6 +123,13 @@ def simulate_trend_rolling_strategy(
     다른 매수/매도 신호와 겹치면 함께 반영된다(예: 매수 신호가 같이 뜨면 순증분에서
     1/3을 뺀 만큼만 순매수/순매도). G가 다시 정상(Up구름 아래)으로 돌아와도 축소분을
     자동으로 복구하지 않는다 - 재진입은 기존 매수 신호(엔하2/바닥4 터치)로만 이뤄진다.
+
+    immediate_touch=False(기본)이면 "터치 후 반대방향 확인" 방식을 쓴다: 매수 라인
+    (엔하2/바닥4)은 어제 아래에 있다가 오늘 위로 회복해야, 매도 라인(엔상2/꼭지4)은
+    어제 위에 있다가 오늘 아래로 반전해야 신호가 뜬다(지금까지의 최종전략과 동일).
+    immediate_touch=True이면 "즉시터치" 방식을 쓴다: 방향이 반대로, 매수 라인은 어제
+    위에 있다가 오늘 그 이하로 내려오는 순간, 매도 라인은 어제 아래에 있다가 오늘 그
+    이상으로 올라오는 순간 바로 신호가 뜬다(반대방향 확인 없이 즉시 체결 예약).
     """
     df = df.sort_values("Date").reset_index(drop=True)
     n = len(df)
@@ -201,21 +225,22 @@ def simulate_trend_rolling_strategy(
         sell_kkokji = False
         sell_ensang2 = False
 
+        # 확인방식(기본): 매수는 아래→위로 회복(from_above=False), 매도는 위→아래로 반전(from_above=True).
+        # 즉시터치: 방향이 정반대 - 매수는 위→아래로 닿는 순간, 매도는 아래→위로 닿는 순간.
+        buy_from_above = immediate_touch
+        sell_from_above = not immediate_touch
+
         if uptrend:
-            ha2_t, ha2_prev = en_ha2[t], en_ha2[t - 1]
-            bd_t, bd_prev = badak4[t], badak4[t - 1]
-            buy_enha2 = pd.notna(ha2_t) and pd.notna(ha2_prev) and close_prev < ha2_prev and close_t >= ha2_t
-            buy_badak = pd.notna(bd_t) and pd.notna(bd_prev) and close_prev < bd_prev and close_t >= bd_t
+            buy_enha2 = _touch(close_prev, close_t, en_ha2[t - 1], en_ha2[t], buy_from_above)
+            buy_badak = _touch(close_prev, close_t, badak4[t - 1], badak4[t], buy_from_above)
             if buy_enha2:
                 step_delta += UNIT        # 엔하2 터치 → 1유닛
             if buy_badak:
                 step_delta += 2 * UNIT    # 바닥4 터치 → 2유닛
 
         if downtrend:
-            es2_t, es2_prev = en_sang2[t], en_sang2[t - 1]
-            kk_t, kk_prev = kkokji4[t], kkokji4[t - 1]
-            sell_ensang2 = pd.notna(es2_t) and pd.notna(es2_prev) and close_prev > es2_prev and close_t <= es2_t
-            sell_kkokji = pd.notna(kk_t) and pd.notna(kk_prev) and close_prev > kk_prev and close_t <= kk_t
+            sell_ensang2 = _touch(close_prev, close_t, en_sang2[t - 1], en_sang2[t], sell_from_above)
+            sell_kkokji = _touch(close_prev, close_t, kkokji4[t - 1], kkokji4[t], sell_from_above)
 
         atr_stop = (
             atr_multiplier is not None
@@ -353,6 +378,15 @@ def summarize_calmar_row(equity: pd.Series, trades_df: pd.DataFrame, label: str)
     }
 
 
+def summarize_full_row(equity: pd.Series, trades_df: pd.DataFrame, label: str) -> dict:
+    """summarize_strategy(승률/평균/중앙값/총수익률/MDD)에 Calmar까지 더한 전체 요약."""
+    row = summarize_strategy(equity, trades_df, label)
+    mdd = row["MDD(%)"]
+    calmar = row["총수익률(%)"] / abs(mdd) if mdd != 0 else float("inf")
+    row["Calmar(총수익률/|MDD|)"] = round(calmar, 2) if calmar != float("inf") else calmar
+    return row
+
+
 def run_atr_sweep(df: pd.DataFrame, equity_baseline: pd.Series, trades_baseline: pd.DataFrame) -> pd.DataFrame:
     """
     ATR 배수를 SWEEP_MULTIPLIERS(4/5/6/8)로 스윕해, whipsaw 손실과 하락장 방어 사이의
@@ -474,6 +508,35 @@ def main():
 
     ginversion_df.to_csv(GINVERSION_RESULTS_PATH, index=False, encoding="utf-8-sig")
     print(f"\n[INFO] 결과 저장 완료: {GINVERSION_RESULTS_PATH}")
+
+    # --- "즉시터치" vs "터치 후 반대방향 확인"(기존 채택 방식) 비교. 기준선(G역전 없음)과
+    # 최종전략(G역전1/3축소) 두 구성 각각에서 터치 방식만 바꿔본다.
+    equity_imm, trades_imm, total_bought_imm, total_sold_imm = simulate_trend_rolling_strategy(
+        df, immediate_touch=True
+    )
+    implied_imm = total_bought_imm - total_sold_imm
+    print(f"\n[검증(즉시터치, 기준선)] 매수비중합({total_bought_imm:.4f}) - 매도비중합({total_sold_imm:.4f}) = {implied_imm:.4f}")
+
+    equity_imm_ginv, trades_imm_ginv, total_bought_imm_ginv, total_sold_imm_ginv = simulate_trend_rolling_strategy(
+        df, reduce_on_g_inversion=True, immediate_touch=True
+    )
+    implied_imm_ginv = total_bought_imm_ginv - total_sold_imm_ginv
+    print(
+        f"\n[검증(즉시터치+G역전1/3축소)] 매수비중합({total_bought_imm_ginv:.4f}) - "
+        f"매도비중합({total_sold_imm_ginv:.4f}) = {implied_imm_ginv:.4f}"
+    )
+
+    touchmode_df = pd.DataFrame([
+        summarize_full_row(equity, trades_df, "확인방식(기준선)"),
+        summarize_full_row(equity_imm, trades_imm, "즉시터치(기준선)"),
+        summarize_full_row(equity_ginv, trades_ginv, "확인방식 + G역전1/3축소(최종전략)"),
+        summarize_full_row(equity_imm_ginv, trades_imm_ginv, "즉시터치 + G역전1/3축소"),
+    ])
+    print("\n[비교: 확인방식 vs 즉시터치 (기준선 / G역전1/3축소 각각)]")
+    print(touchmode_df.to_string(index=False))
+
+    touchmode_df.to_csv(TOUCH_MODE_RESULTS_PATH, index=False, encoding="utf-8-sig")
+    print(f"\n[INFO] 결과 저장 완료: {TOUCH_MODE_RESULTS_PATH}")
 
 
 if __name__ == "__main__":
