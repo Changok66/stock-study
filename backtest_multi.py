@@ -59,6 +59,15 @@ GROUPS = {
         "results_path": "data/backtest_results_holdings.csv",
         "trades_path": "data/backtest_trades_holdings.csv",
     },
+    "soxl": {
+        # SOXL(미국 상장, Direxion Daily Semiconductor Bull 3x ETF, 3배 레버리지)은
+        # 국내종목군(stocks/holdings)과 통화/거래시간/변동성이 달라 별도 그룹으로 분리한다.
+        # data/price_SOXL.csv는 get_data.py --source fdr --code SOXL --start 2010-03-11로
+        # 상장일(2010-03-11)부터 전체 기간을 받은 데이터다.
+        "registry": {"SOXL": {"name": "SOXL(반도체 3배 레버리지)", "output": "data/price_SOXL.csv"}},
+        "results_path": "data/backtest_results_soxl.csv",
+        "trades_path": "data/backtest_trades_soxl.csv",
+    },
 }
 
 
@@ -133,22 +142,35 @@ def run_cloud_strategy(df: pd.DataFrame, crossovers: pd.DataFrame) -> tuple[pd.D
     return trades_df, position
 
 
-def summarize(trades_df: pd.DataFrame) -> dict:
+def summarize(trades_df: pd.DataFrame, price_df: pd.DataFrame | None = None) -> dict:
     """
     종목 하나의 매매 내역을 승률/손익비/총수익률/MDD로 요약한다.
     metrics.py/backtest.py의 계산 함수를 그대로 재사용한다.
-    (단일 종목은 매매가 겹칠 일이 없으므로 복리 누적 방식 그대로 써도 된다 -
+    (단일 종목은 매매가 겹칠 일이 없으므로 총수익률은 거래 결과 복리 누적 그대로 써도 된다 -
     여러 종목을 합산할 때의 문제는 build_equity_series/combine_equal_weight_portfolio 참고)
+
+    price_df(해당 종목의 Date/Open/Close)가 주어지면 metrics.calc_mdd()가 일별
+    mark-to-market 방식으로 MDD를 계산한다. 여러 종목을 합친 매매 내역(전체 합산 행)처럼
+    단일 가격 시계열이 없는 경우는 price_df 없이 호출되는데, 그 경우의 MDD는 어차피
+    main()에서 균등비중 포트폴리오 자산곡선 기준 MDD(compute_portfolio_return_mdd)로
+    덮어써지므로, 여기서는 참고용으로 예전 방식(거래 결과 복리 누적)의 근사치만 반환한다.
     """
     if trades_df.empty:
         return {"매매건수": 0, "승률(%)": 0.0, "손익비": 0.0, "총수익률(%)": 0.0, "MDD(%)": 0.0}
+
+    if price_df is not None:
+        mdd = metrics.calc_mdd(trades_df, price_df)
+    else:
+        cumulative = (1 + trades_df["수익률(%)"] / 100).cumprod()
+        running_max = cumulative.cummax()
+        mdd = ((cumulative - running_max) / running_max).min() * 100
 
     return {
         "매매건수": len(trades_df),
         "승률(%)": round(metrics.calc_win_rate(trades_df), 2),
         "손익비": round(metrics.calc_profit_loss_ratio(trades_df), 2),
         "총수익률(%)": round(bt.compute_cumulative_return(trades_df), 2),
-        "MDD(%)": round(metrics.calc_mdd(trades_df), 2),
+        "MDD(%)": round(mdd, 2),
     }
 
 
@@ -236,7 +258,7 @@ def main():
         df, crossovers = prepare_stock_data(path)
         trades_df, open_position = run_cloud_strategy(df, crossovers)
 
-        summary = {"종목코드": code, "종목명": name, **summarize(trades_df)}
+        summary = {"종목코드": code, "종목명": name, **summarize(trades_df, df)}
         results.append(summary)
         equity_series_list.append(build_equity_series(trades_df))
 

@@ -78,16 +78,21 @@ KIWOOM_MAX_PAGES = 30
 KIWOOM_REQUEST_INTERVAL = 0.3
 
 
-def get_date_range():
+def get_date_range(start_override: str | None = None):
     """
     오늘 날짜를 기준으로 최근 5년(LOOKBACK_DAYS일)에 해당하는
     시작일과 종료일 문자열(YYYY-MM-DD)을 반환한다.
+
+    start_override가 주어지면(예: SOXL처럼 상장 초기부터 긴 기간을 보고 싶은 경우)
+    5년 lookback 대신 그 날짜를 시작일로 그대로 쓴다. 다른 종목(--all/--holdings/
+    기본 --code)은 이 인자를 넘기지 않으므로 기존 5년 lookback 동작에는 영향이 없다.
     """
     end_date = datetime.today()
     start_date = end_date - timedelta(days=LOOKBACK_DAYS)
 
     # FinanceDataReader는 'YYYY-MM-DD' 형식의 문자열을 인자로 받는다
-    return start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
+    start_str = start_override if start_override else start_date.strftime("%Y-%m-%d")
+    return start_str, end_date.strftime("%Y-%m-%d")
 
 
 def fetch_fdr_ohlcv(stk_cd: str, start_date: str, end_date: str):
@@ -103,8 +108,17 @@ def fetch_fdr_ohlcv(stk_cd: str, start_date: str, end_date: str):
     - Change: 전일 대비 등락률
 
     인덱스는 거래일(Date, datetime 형식)이다.
+
+    국내 종목(KRX)은 인덱스 이름이 "Date"이고 "Change" 컬럼을 포함해 오지만,
+    SOXL처럼 해외 티커는 fdr이 내부적으로 다른 백엔드(야후 파이낸스)를 타면서
+    인덱스 이름이 비어 있고 "Change" 대신 "Adj Close"를 준다. save_to_csv() 이후
+    fibo_indicator.load_data()가 "Date" 컬럼명을 그대로 기대하므로, 여기서
+    인덱스 이름과 Change 컬럼(종가 기준 등락률)을 다른 종목과 동일한 형태로 맞춰준다.
     """
     df = fdr.DataReader(stk_cd, start_date, end_date)
+    df.index.name = "Date"
+    if "Change" not in df.columns:
+        df["Change"] = df["Close"].pct_change()
     return df
 
 
@@ -260,6 +274,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--code", default="005930", help="종목코드 (기본값 005930=삼성전자). --all/--holdings와 함께 쓰면 무시된다")
     parser.add_argument("--all", action="store_true", help="STOCKS에 등록된 전체 종목을 한 번에 조회")
     parser.add_argument("--holdings", action="store_true", help="HOLDINGS(실제 보유종목)에 등록된 전체 종목을 한 번에 조회")
+    parser.add_argument(
+        "--start", default=None,
+        help="FDR 조회 시작일(YYYY-MM-DD) 직접 지정. 기본 5년 lookback 대신 이 날짜부터 조회(--source fdr에서만 사용, 예: SOXL 상장일부터 전체 기간)",
+    )
     return parser.parse_args()
 
 
@@ -288,7 +306,7 @@ def main():
         output_path = info.get("output", f"data/price_{code}.csv")
 
         if args.source == "fdr":
-            start_date, end_date = get_date_range()
+            start_date, end_date = get_date_range(args.start)
             print(f"[INFO] {name}({code}) 일봉 데이터 조회 기간(FDR): {start_date} ~ {end_date}")
             df = fetch_fdr_ohlcv(code, start_date, end_date)
         else:

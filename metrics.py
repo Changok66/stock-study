@@ -5,12 +5,75 @@ backtest.py가 만든 매매 내역(data/backtest_trades.csv)을 읽어
 
 import pandas as pd
 
+import backtest as bt
+import fibo_indicator as fi
+
 TRADES_CSV_PATH = "data/backtest_trades.csv"
 
 
 def load_trades(path: str = TRADES_CSV_PATH) -> pd.DataFrame:
     """매매 내역 CSV를 읽어 DataFrame으로 반환한다."""
     return pd.read_csv(path, encoding="utf-8-sig")
+
+
+def build_daily_equity(trades_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.Series:
+    """
+    매매 내역(매수일/매도일)과 종목의 일별 시가/종가(price_df, Date/Open/Close 컬럼)를 이용해,
+    실제 보유 중 일별 가격 변동을 그대로 반영한 mark-to-market 누적자산(시작=1.0) 시계열을 만든다.
+
+    - 매수일: 그날 시가에 매수(매수 수수료 반영). 전날 종가~그날 시가(오버나이트) 구간은
+      아직 매수 전이므로 미보유, 그날 시가~종가(장중) 구간부터 보유가 반영된다.
+    - 매도일: 그날 시가에 매도(매도 수수료+거래세 반영). 전날 종가~그날 시가(오버나이트)
+      구간까지는 보유 중이었으므로 반영되고, 시가~종가(장중) 구간은 매도 후라 미보유.
+    - 매수일과 매도일 사이의 날: 하루 종일(전날 종가~그날 종가) 보유가 반영된다.
+    - 포지션이 없는 날은 직전 값을 그대로 유지한다(현금 보유와 동일 - 가격 변동 없음).
+
+    단일 종목(포지션이 겹치지 않음)을 전제로 한다. 여러 종목을 합친 매매 내역을 넣으면
+    안 된다 - 그 경우는 backtest_multi.py의 build_equity_series/combine_equal_weight_portfolio
+    (종목별 자산곡선을 균등비중으로 합산)를 대신 써야 한다.
+    """
+    if trades_df.empty:
+        return pd.Series(dtype=float)
+
+    price_df = price_df.sort_values("Date").reset_index(drop=True)
+    dates = price_df["Date"]
+    opens = price_df["Open"].to_numpy()
+    closes = price_df["Close"].to_numpy()
+    n = len(price_df)
+
+    buy_dates = set(pd.to_datetime(trades_df["매수일"]))
+    sell_dates = set(pd.to_datetime(trades_df["매도일"]))
+
+    current_weight = 0.0
+    equity = [1.0] * n
+    for t in range(n):
+        date = dates.iloc[t]
+        weight_overnight = current_weight
+
+        if date in buy_dates:
+            new_weight = 1.0
+        elif date in sell_dates:
+            new_weight = 0.0
+        else:
+            new_weight = current_weight
+
+        delta = new_weight - current_weight
+        current_weight = new_weight
+
+        if t == 0:
+            continue
+
+        overnight_factor = 1 + weight_overnight * (opens[t] / closes[t - 1] - 1)
+        if delta > 0:
+            fee_factor = 1 - delta * bt.BUY_FEE_RATE
+        elif delta < 0:
+            fee_factor = 1 - abs(delta) * bt.SELL_FEE_RATE
+        else:
+            fee_factor = 1.0
+        intraday_factor = 1 + new_weight * (closes[t] / opens[t] - 1)
+        equity[t] = equity[t - 1] * overnight_factor * fee_factor * intraday_factor
+
+    return pd.Series(equity, index=pd.DatetimeIndex(dates))
 
 
 def calc_win_rate(trades: pd.DataFrame) -> float:
@@ -49,21 +112,29 @@ def calc_profit_loss_ratio(trades: pd.DataFrame) -> float:
     return wins.mean() / abs(losses.mean())
 
 
-def calc_mdd(trades: pd.DataFrame) -> float:
+def calc_mdd(trades: pd.DataFrame, price_df: pd.DataFrame) -> float:
     """
-    최대낙폭(MDD, Maximum Drawdown, %): 매매를 순서대로 복리 누적했을 때의
-    자산 곡선이, 그 시점까지의 고점(peak) 대비 가장 많이 떨어졌던 비율.
+    최대낙폭(MDD, Maximum Drawdown, %): 매매 내역을 일별 시가/종가에 그대로
+    mark-to-market한 자산곡선(build_daily_equity)이, 그 시점까지의 고점(peak)
+    대비 가장 많이 떨어졌던 비율.
 
     이 숫자가 뜻하는 것: 이 전략을 그대로 따라했을 때 과거 기준으로 자산이
     최고점 대비 최대 몇 %까지 줄어든 적이 있었는지를 나타낸다. 절댓값이 클수록
     변동성과 리스크가 크고, 실제로 버티기 심리적으로 힘든 전략이라는 뜻이다.
+
+    예전에는 완료된 거래의 결과값만 순서대로 복리 계산해서 MDD를 구했는데, 그
+    방식은 보유 도중(매수일~매도일 사이)의 일별 고점/저점을 놓친다 - 어떤 거래가
+    최종적으로는 -5% 손실로 끝났어도 보유 중에 장중 고점을 찍고 내려온 것이라면
+    실제로는 그 고점 대비 더 크게 떨어진 것인데 예전 방식은 이를 포착하지 못해
+    변동성이 큰 종목(SOXL 같은 레버리지 ETF)일수록 MDD를 과소평가했다. 그래서
+    일별 mark-to-market 방식으로 교체했다.
     """
     if trades.empty:
         return 0.0
 
-    cumulative = (1 + trades["수익률(%)"] / 100).cumprod()
-    running_max = cumulative.cummax()
-    drawdown = (cumulative - running_max) / running_max
+    equity = build_daily_equity(trades, price_df)
+    running_max = equity.cummax()
+    drawdown = (equity - running_max) / running_max
     return drawdown.min() * 100
 
 
@@ -92,10 +163,11 @@ def calc_sharpe_ratio(trades: pd.DataFrame) -> float:
 
 def main():
     trades = load_trades()
+    price_df = fi.load_data(fi.INPUT_PATH)
     print(f"[INFO] 매매 건수: {len(trades)}건")
     print(f"승률: {calc_win_rate(trades):.2f}%")
     print(f"손익비: {calc_profit_loss_ratio(trades):.2f}")
-    print(f"최대낙폭(MDD): {calc_mdd(trades):.2f}%")
+    print(f"최대낙폭(MDD): {calc_mdd(trades, price_df):.2f}%")
     print(f"샤프비율: {calc_sharpe_ratio(trades):.2f}")
 
 
